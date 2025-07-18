@@ -68,7 +68,7 @@ def process_summary_result(
             if is_automated and jira_component == "Objects > Object Entries REST APIs":
                 summary = "\\[move to integration\\]" + test_name
             elif is_automated:
-                summary = "\\\\[move to playwright\\] " + test_name
+                summary = "\\[move to playwright\\] " + test_name
             else:
                 summary = "\\[test-fix\\] " + test_name
 

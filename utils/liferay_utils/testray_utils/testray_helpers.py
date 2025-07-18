@@ -66,11 +66,11 @@ def process_summary_result(
             is_automated = is_automated_functional_test(case_id)
 
             if is_automated and jira_component == "Objects > Object Entries REST APIs":
-                summary = "\\[move to integration\\]" + test_name
+                summary = "[move to integration]" + test_name
             elif is_automated:
-                summary = "\\\\[move to playwright\\] " + test_name
+                summary = "[move to playwright] " + test_name
             else:
-                summary = "\\[test-fix\\] " + test_name
+                summary = "[test-fix] " + test_name
 
             description = (
                 "*Testray Result*\n"
@@ -493,10 +493,12 @@ def report_poshi_tests_decrease(start_of_quarter_count, current_count):
     decrease_percent = (items_less / start_of_quarter_count) * 100
 
     if decrease_percent < 10.0:
-        print(f"POSHI tests decrease: {decrease_percent:.2f}% since start of Q3. "
-              f"We need 10.0% decrease, so, get to work! :P")
+        print(f"The total number of POSHI tests has gone down by {decrease_percent:.2f}% "
+              f"compared to what it was at the beginning of the quarter. "
+              f"We're targeting a 10% decrease, so there's still work to do.")
     else:
-        print(f"POSHI tests decrease: {decrease_percent:.2f}% since start of Q3. "
+        print(f"The total number of POSHI tests has gone down by {decrease_percent:.2f}% "
+              f"compared to what it was at the beginning of the quarter. "
               f"KPI of 10% accomplished, but keep pushing!")
 
 

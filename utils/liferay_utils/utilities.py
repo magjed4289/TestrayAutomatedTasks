@@ -52,9 +52,6 @@ def normalize_error(error):
     error = re.sub(r'\d+\s*(ms|s|seconds|minutes|m)', '', error)  # durations
     error = re.sub(r'".*?"', '"..."', error)  # replace quoted strings with placeholder
 
-    # Lowercase for uniformity
-    error = error.lower()
-
     return error
 
 def parse_execution_date(date_str):

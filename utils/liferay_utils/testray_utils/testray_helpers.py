@@ -6,12 +6,15 @@ from collections import defaultdict
 from datetime import time
 from html import escape
 
-import jellyfish
+
+from sentence_transformers import SentenceTransformer, util
 
 from liferay.teams.headless.headless_contstants import ComponentMapping
 from utils.liferay_utils.jira_utils.jira_helpers import get_issue_status_by_key, create_task_for_flaky_test
 from utils.liferay_utils.testray_utils.testray_api import *
 from utils.liferay_utils.utilities import *
+
+model = SentenceTransformer('all-MiniLM-L6-v2')
 
 def process_summary_result(
         summary_result,
@@ -134,9 +137,9 @@ def sort_cases_by_duration(subtask_case_pairs, case_duration_lookup):
 def build_case_rows(sorted_cases, case_duration_lookup, build_id):
     printed_rows = []
     rca_info = None
-    batch_name = None
-    test_selector = None
-    github_compare = None
+    rca_batch = None
+    rca_selector = None
+    rca_compare = None
 
     header = f"{'Case Name':<150} {'Duration':<15} {'Component Name':<30}"
     #print(header)
@@ -165,6 +168,10 @@ def build_case_rows(sorted_cases, case_duration_lookup, build_id):
 
             if not rca_info and batch_name and test_selector:
                 rca_info = build_rca_block(batch_name, test_selector, github_compare)
+                rca_batch = batch_name
+                rca_selector = test_selector
+                rca_compare = github_compare
+
             elif not rca_info:
                 rca_info = f"\nCompare: {github_compare}"
 
@@ -174,7 +181,7 @@ def build_case_rows(sorted_cases, case_duration_lookup, build_id):
         except Exception as e:
             print(f"[ERROR] Failed to fetch data for case_id={case_id} → {e}")
 
-    return printed_rows, rca_info, batch_name, test_selector, github_compare
+    return printed_rows, rca_info, rca_batch, rca_selector, rca_compare
 
 
 def get_batch_info(case_name, case_type_name):
@@ -297,46 +304,8 @@ def build_flaky_result_metadata(latest_build_id,result, case_id, result_error):
         "component": get_component_name(case_info.get("r_componentToCases_c_componentId")) or "Unknown"
     }
 
-def find_similar_open_issue_for_unique(jira_connection, case_id, result_error):
-    """Look for similar errors in history with open Jira issues."""
-    history = get_case_result_history_for_routine_not_passed(case_id)
-
-    seen_issues = set()
-
-    for past_result in history:
-        history_error_norm = normalize_error(past_result.get("error", ""))
-        result_error_norm = normalize_error(result_error)
-
-        if not are_errors_similar(result_error_norm, history_error_norm):
-            continue
-
-        issues_str = past_result.get("issues", "")
-        if not issues_str:
-            continue
-
-        issue_keys = [key.strip() for key in issues_str.split(",")]
-
-        for issue_key in issue_keys:
-            if issue_key in seen_issues:
-                continue
-
-            try:
-                issue, status = get_issue_status_by_key(jira_connection, issue_key)
-                if status != "Closed":
-                    return True, {
-                        "dueStatus": {"key": "BLOCKED", "name": "Blocked"},
-                        "issues": issue_key
-                    }
-                seen_issues.add(issue_key)
-            except Exception as e:
-                print(f"Error retrieving issue {issue_key}: {e}")
-    return False, None
-
-
 def handle_flaky_result(latest_build_id,jira_connection, result, case_id, result_error):
-    history = get_case_result_history_for_routine_not_passed(case_id)
-
-    similar_open_issues = find_similar_open_issues(jira_connection, history, result_error)
+    similar_open_issues = find_similar_open_issues(jira_connection, case_id, result_error, return_list=True)
 
     if is_module_integration_test(case_id):
         return handle_module_integration_flaky(latest_build_id,result, case_id, result_error, similar_open_issues)
@@ -353,39 +322,64 @@ def handle_flaky_result(latest_build_id,jira_connection, result, case_id, result
     return False, None, build_flaky_result_metadata(latest_build_id,result, case_id, result_error)
 
 
-def find_similar_open_issues(jira_connection, history, result_error):
+def find_similar_open_issues(jira_connection, case_id, result_error, *, return_list=False):
+    """
+    Look for similar errors in history that have open Jira issues.
+
+    Args:
+        jira_connection: Authenticated Jira connection
+        case_id: Identifier to retrieve test history
+        result_error: The current error message
+        return_list: If True, return list of issue keys; if False, return BLOCKED dict
+
+    Returns:
+        If return_list=True:
+            List of matching open issue keys (or empty list if none)
+        Else:
+            Tuple[bool, dict or None] - like the original 'for_unique' function
+    """
     seen_issues = set()
     similar_open_issues = []
 
+    history = get_case_result_history_for_routine_not_passed(case_id)
+    result_error_norm = normalize_error(result_error)
+
     for past_result in history:
-        result_error_norm = normalize_error(result_error)
-        history_error_norm = normalize_error(past_result.get("error", ""))
-
-        if not are_errors_similar(result_error_norm, history_error_norm):
-            continue
-
         issues_str = past_result.get("issues", "")
         if not issues_str:
             continue
 
-        print(f"{issues_str}")
         issue_keys = [key.strip() for key in issues_str.split(",")]
+        open_issues = []
 
         for issue_key in issue_keys:
             if issue_key in seen_issues:
                 continue
-
             try:
-                issue, status = get_issue_status_by_key(jira_connection, issue_key)
+                _, status = get_issue_status_by_key(jira_connection, issue_key)
                 if status != "Closed":
-                    similar_open_issues.append(issue_key)
-                    seen_issues.add(issue_key)
-                    # Stop at first open issue
-                    return similar_open_issues
+                    open_issues.append(issue_key)
+                seen_issues.add(issue_key)
             except Exception as e:
                 print(f"Error retrieving issue {issue_key}: {e}")
 
-    return similar_open_issues
+        if not open_issues:
+            continue
+
+        history_error = past_result.get("error", "")
+        history_error_norm = normalize_error(history_error)
+
+        if are_errors_similar(result_error_norm, history_error_norm):
+            if return_list:
+                similar_open_issues.extend(open_issues)
+                return similar_open_issues  # stop at first
+            else:
+                return True, {
+                    "dueStatus": {"key": "BLOCKED", "name": "Blocked"},
+                    "issues": ", ".join(open_issues)
+                }
+
+    return similar_open_issues if return_list else (False, None)
 
 
 def handle_module_integration_flaky(latest_build_id,result, case_id, result_error, similar_open_issues):
@@ -424,7 +418,7 @@ def add_to_unique_tasks(unique_tasks, subtask_id, case_id, error):
 
 
 def process_unique_result(jira_connection, result, case_id, result_error, batch_updates):
-    found, update_data = find_similar_open_issue_for_unique(jira_connection, case_id, result_error)
+    found, update_data = find_similar_open_issues(jira_connection, case_id, result_error)
 
     if found:
         update_data["id"] = result["id"]
@@ -554,12 +548,28 @@ def print_summary_report(total_reused, total_unique, total_flaky_without_issue):
     print(f"Total unique tasks: {total_unique}")
     print(f"Total flaky tests without open Jira issue: {len(total_flaky_without_issue)}")
 
+def are_errors_similar(current_norm, history_norm, threshold=0.8):
+    """
+    Compare two error messages semantically using sentence embeddings.
+    """
+    emb_a = model.encode(current_norm, convert_to_tensor=True)
+    emb_b = model.encode(history_norm, convert_to_tensor=True)
+    similarity = util.pytorch_cos_sim(emb_a, emb_b).item()
 
-def are_errors_similar(current, history, threshold=0.6):
-    current_norm = normalize_error(current)
-    history_norm = normalize_error(history)
-    similarity = jellyfish.jaro_winkler_similarity(current_norm, history_norm)
     return similarity >= threshold
+
+#def are_errors_similar(current, history, threshold=0.6):
+#    current_norm = normalize_error(current)
+#    history_norm = normalize_error(history)
+#
+#    similarity = jellyfish.jaro_winkler_similarity(current_norm, history_norm)
+#
+#    if "testGetObjectEntryWithKeywords" in current:
+#        print("Current norm:", current_norm)
+#        print("History norm:", history_norm)
+#        print("Similarity between them:", str(similarity))
+#
+#    return similarity >= threshold
 
 def print_flaky_tests_without_issues(flaky_tests):
     print("\n--- Flaky Tests Without Jira Issue ---")

@@ -62,8 +62,20 @@ STATUS_FAILED_PASSED = "FAILED,PASSED"
 # ============================ HTTP HELPERS ============================
 
 def get_json(url):
-    """Send GET request and return JSON response."""
+    """Send GET request and return JSON response. Refresh token if 401."""
+    global ACCESS_TOKEN, HEADERS  # so we can update them
+
     response = requests.get(url, headers=HEADERS)
+
+    if response.status_code == 401:
+        # refresh token
+        ACCESS_TOKEN = get_access_token()
+        HEADERS = {
+            "Authorization": f"Bearer {ACCESS_TOKEN}",
+            "Accept": "application/json"
+        }
+        response = requests.get(url, headers=HEADERS)
+
     response.raise_for_status()
     return response.json()
 
@@ -177,6 +189,28 @@ def get_all_cases_info_from_build(build_id):
         page += 1
 
     return all_cases_info
+
+def get_all_builds(routine_id=HEADLESS_ROUTINE_ID):
+    """
+    Fetch all builds for a given routine, handling pagination.
+    Defaults to HEADLESS routine.
+    """
+    all_builds = []
+    page = 1
+
+    while True:
+        data = get_routine_builds(routine_id, page=page)
+        items = data.get("items", [])
+        if not items:
+            break
+
+        all_builds.extend(items)
+        if len(items) < 100:  # last page
+            break
+        page += 1
+
+    # Sort builds by dateCreated descending
+    return sorted(all_builds, key=lambda b: b.get("dateCreated", ""), reverse=True)
 
 def get_all_build_case_results(build_id):
     """Fetch all case results for a given build (paginated)."""

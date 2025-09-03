@@ -30,6 +30,10 @@ def process_summary_result(
         case_id_to_result,
         total_flaky_without_issue,
 ):
+    error = (summary_result.get("errors") or "")
+    if should_skip_result(error):
+        print(f"✔ Skipping result in subtask {subtask_id} due to known keyword")
+        return True, None, False
     case_id = summary_result.get("r_caseToCaseResult_c_caseId")
     result_error = summary_result.get("errors", "")
     result_error_norm = normalize_error(result_error)
@@ -55,7 +59,6 @@ def process_summary_result(
             batch_updates.append(update_data)
             return True, None, False
 
-        # Flaky but not handled
         total_flaky_without_issue.append(info)
 
         test_name = info.get("test_name")
@@ -281,6 +284,9 @@ def get_latest_build_with_completed_task(builds):
                 return build
     return None
 
+def is_handled(result):
+    err = (result.get("errors") or "")
+    return bool(result.get("issues")) or should_skip_result(err)
 
 def should_skip_result(error):
     skip_error_keywords = [

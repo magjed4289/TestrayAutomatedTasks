@@ -100,11 +100,16 @@ def analyze_testflow(jira_connection):
     if batch_updates:
         assign_issue_to_case_result_batch(batch_updates)
 
+        subtask_results = {}
+        for subtask in subtasks:
+            subtask_id = subtask["id"]
+            subtask_results[subtask_id] = get_subtask_case_results(subtask_id)
+
     for subtask in subtasks:
         subtask_id = subtask["id"]
         summary_results = subtask_results.get(subtask_id, [])
 
-        if all(result.get("issues") for result in summary_results):
+        if summary_results and all(is_handled(r) for r in summary_results):
             if subtask.get("dueStatus", {}).get("key") != "COMPLETE":
                 print(f"✔ Marking subtask {subtask_id} as complete")
                 update_subtask_status(subtask_id)

@@ -3,6 +3,7 @@
 import base64
 import requests
 from dotenv import load_dotenv
+from functools import lru_cache
 
 import os
 from pathlib import Path
@@ -229,11 +230,11 @@ def get_all_build_case_results(build_id):
 
     return all_items
 
+@lru_cache(maxsize=None)
 def get_build_info(build_id):
     """Get build metadata, including routine ID and due date."""
     url = f"{BASE_URL}/builds/{build_id}?fields=dueDate,gitHash,name,id,importStatus,r_routineToBuilds_c_routineId&nestedFields=buildToTasks"
     return get_json(url)
-
 
 def get_build_tasks(build_id):
     """Get tasks associated with a build."""
@@ -241,23 +242,25 @@ def get_build_tasks(build_id):
     return get_json(url).get("items", [])
 
 
+@lru_cache(maxsize=None)
 def get_case_info(case_id):
     """Get the name and priority of a test case."""
     url = f"{BASE_URL}/cases/{case_id}"
     return get_json(url)
-
 
 def get_case_result(case_result_id):
     url = f"{BASE_URL}/caseresults/{case_result_id}"
     return get_json(url)
 
 
+@lru_cache(maxsize=None)
 def get_case_type_name(case_type_id):
     """Get name of a case type by ID."""
     url = f"{BASE_URL}/casetypes/{case_type_id}?fields=name"
     return get_json(url).get("name", "Unknown")
 
 
+@lru_cache(maxsize=None)
 def get_component_name(component_id):
     """Get name of a component by ID."""
     url = f"{BASE_URL}/components/{component_id}?fields=name"

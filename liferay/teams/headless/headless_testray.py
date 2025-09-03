@@ -65,6 +65,7 @@ def analyze_testflow(jira_connection):
     batch_updates = []
     case_id_to_result = {}
     subtasks_to_complete = []
+    case_history_cache = {}
 
     for subtask in subtasks:
         subtask_id = subtask["id"]
@@ -94,6 +95,7 @@ def analyze_testflow(jira_connection):
                 case_ids=case_ids,
                 case_id_to_result=case_id_to_result,
                 total_flaky_without_issue=total_flaky_without_issue,
+                history_cache=case_history_cache,
             )
 
             first_result = False
@@ -127,6 +129,7 @@ def analyze_testflow(jira_connection):
             case_id_to_result=case_id_to_result,
             build_id=latest_build_id,
             output_path="reports/combined_report.html",
+            history_cache=case_history_cache,
         )
     else:
         print(f"✔ Task {task_id} is now complete. No further processing required.")

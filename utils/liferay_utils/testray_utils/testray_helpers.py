@@ -29,6 +29,7 @@ def process_summary_result(
         case_ids,
         case_id_to_result,
         total_flaky_without_issue,
+        history_cache,
 ):
     error = (summary_result.get("errors") or "")
     if should_skip_result(error):
@@ -48,7 +49,7 @@ def process_summary_result(
     if existing_issue:
         return True, None, False
 
-    is_flaky = detect_flakiness(case_id, result_error_norm)
+    is_flaky = detect_flakiness(case_id, result_error_norm, history_cache)
 
     if is_flaky:
         handled, update_data, info = handle_flaky_result(
@@ -137,7 +138,7 @@ def sort_cases_by_duration(subtask_case_pairs, case_duration_lookup):
     return sorted(subtask_case_pairs, key=lambda pair: safe_duration(pair[1]))
 
 
-def build_case_rows(sorted_cases, case_duration_lookup, build_id):
+def build_case_rows(sorted_cases, case_duration_lookup, build_id, history_cache):
     printed_rows = []
     rca_info = None
     rca_batch = None
@@ -147,6 +148,8 @@ def build_case_rows(sorted_cases, case_duration_lookup, build_id):
     header = f"{'Case Name':<150} {'Duration':<15} {'Component Name':<30}"
     #print(header)
     #print("-" * (len(header) + 5))
+
+    failing_hash = get_current_build_hash(build_id)
 
     for _, case_id in sorted_cases:
         try:
@@ -158,7 +161,7 @@ def build_case_rows(sorted_cases, case_duration_lookup, build_id):
             case_type_name = get_case_type_name(case_type_id) if case_type_id else "Unknown"
             raw_duration = case_duration_lookup.get(int(case_id))
             duration = raw_duration if isinstance(raw_duration, (int, float)) else None
-            failing_hash, passing_hash = get_last_passing_first_failing_git_hash(case_id, build_id)
+            passing_hash = get_last_passing_git_hash(case_id, build_id, history_cache)
             github_compare = (
                 f"https://github.com/liferay/liferay-portal/compare/{passing_hash}...{failing_hash}"
                 if passing_hash and failing_hash else "###"
@@ -432,8 +435,11 @@ def process_unique_result(jira_connection, result, case_id, result_error, batch_
     return False
 
 
-def detect_flakiness(case_id, current_error_norm):
-    history = get_case_result_history_for_routine(case_id)
+def detect_flakiness(case_id, current_error_norm, history_cache):
+    history = history_cache.get(case_id)
+    if history is None:
+        history = get_case_result_history_for_routine(case_id)
+        history_cache[case_id] = history
 
     if not history:
         return False, "no_history"
@@ -720,14 +726,20 @@ def filter_case_result_history_by_build(history, build_id):
     ]
 
 
-def get_last_passing_first_failing_git_hash(case_id, build_id):
-    first_failing_hash = get_current_build_hash(build_id)
-    entire_history = get_case_result_history_for_routine(case_id)
+def get_last_passing_git_hash(case_id, build_id, history_cache):
+    entire_history = history_cache.get(case_id)
+    if entire_history is None:
+        entire_history = get_case_result_history_for_routine(case_id)
+        history_cache[case_id] = entire_history
+
     result_history_for_build = filter_case_result_history_by_build(entire_history, build_id)
+    if not result_history_for_build:
+        return None
+
     failing_hash_execution_date = result_history_for_build[0].get('executionDate')
     item = get_last_passing_result(entire_history, failing_hash_execution_date)
-    last_passing_hash = item.get('gitHash')
-    return first_failing_hash, last_passing_hash
+    last_passing_hash = item.get('gitHash') if item else None
+    return last_passing_hash
 
 
 def get_current_build_hash(build_id):
@@ -742,7 +754,10 @@ def get_task_routine_id(task_id):
     return build_info["r_routineToBuilds_c_routineId"]
 
 
-def generate_combined_html_report(flaky_tests, unique_tasks, task_id, case_id_to_result, build_id, output_path="combined_report.html"):
+def generate_combined_html_report(flaky_tests, unique_tasks, task_id, case_id_to_result, build_id, output_path="combined_report.html", history_cache=None):
+    if history_cache is None:
+        history_cache = {}
+
     html = [
         "<html>",
         "<head><meta charset='UTF-8'><title>Testray Flaky and Unique Failures Report</title>",
@@ -821,7 +836,7 @@ def generate_combined_html_report(flaky_tests, unique_tasks, task_id, case_id_to
     for error, subtask_case_pairs in error_to_cases.items():
         sorted_cases = sort_cases_by_duration(subtask_case_pairs, case_duration_lookup)
         printed_rows, rca_info, batch_name, test_selector, github_compare = build_case_rows(
-            sorted_cases, case_duration_lookup, build_id
+            sorted_cases, case_duration_lookup, build_id, history_cache
         )
 
         html.append("<div class='subcard unique'>")

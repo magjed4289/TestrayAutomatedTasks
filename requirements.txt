@@ -11,7 +11,7 @@ jellyfish~=1.2.0
 oauthlib==3.2.2
 olefile~=0.47
 packaging==25.0
-pip~=25.1.1
+pip~=25.2
 pillow==11.2.1
 pycryptodome==3.23.0
 PySocks~=1.7.1

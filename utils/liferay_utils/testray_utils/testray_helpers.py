@@ -150,9 +150,6 @@ def build_case_rows(sorted_cases, case_duration_lookup, build_id):
 
     for _, case_id in sorted_cases:
         try:
-            if is_flagged_as_flaky(case_id):
-                continue
-
             case_info = get_case_info(case_id)
             case_name = case_info.get("name", "N/A")
             component_id = case_info.get("r_componentToCases_c_componentId")

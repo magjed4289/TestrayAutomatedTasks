@@ -826,7 +826,7 @@ def generate_combined_html_report(flaky_tests, unique_tasks, task_id, case_id_to
 
         html.append("<div class='subcard unique'>")
 
-        html.append(f"<h3>Error Type</h3><pre>{escape(error)}</pre>")
+        html.append(f"<h3>Error</h3><pre>{escape(error)}</pre>")
 
         if subtask_case_pairs:
             first_subtask_id = subtask_case_pairs[0][0]

@@ -64,8 +64,7 @@ def analyze_testflow(jira_connection):
     case_ids = set()
     batch_updates = []
     case_id_to_result = {}
-
-    subtask_results = {}
+    subtasks_to_complete = []
 
     for subtask in subtasks:
         subtask_id = subtask["id"]
@@ -73,11 +72,16 @@ def analyze_testflow(jira_connection):
             continue
 
         summary_results = get_subtask_case_results(subtask_id)
-        subtask_results[subtask_id] = summary_results
 
+        if not summary_results:
+            continue
+
+        all_results_in_subtask_handled = True
         first_result = True
         for summary_result in summary_results:
-            result_handled, flaky_info, unique_flag = process_summary_result(
+            len_before = len(batch_updates)
+
+            result_handled, flaky_info, is_blocked_unique = process_summary_result(
                 summary_result=summary_result,
                 subtask_id=subtask_id,
                 summary_results=summary_results,
@@ -94,25 +98,24 @@ def analyze_testflow(jira_connection):
 
             first_result = False
 
-            if unique_flag:
+            new_issue_assigned = len(batch_updates) > len_before
+
+            if is_blocked_unique:
                 total_unique += 1
+
+            # A result is considered "handled" if it was already handled, or if we just assigned an issue.
+            if not (result_handled or is_blocked_unique or new_issue_assigned):
+                all_results_in_subtask_handled = False
+
+        if all_results_in_subtask_handled:
+            subtasks_to_complete.append(subtask_id)
 
     if batch_updates:
         assign_issue_to_case_result_batch(batch_updates)
 
-        subtask_results = {}
-        for subtask in subtasks:
-            subtask_id = subtask["id"]
-            subtask_results[subtask_id] = get_subtask_case_results(subtask_id)
-
-    for subtask in subtasks:
-        subtask_id = subtask["id"]
-        summary_results = subtask_results.get(subtask_id, [])
-
-        if summary_results and all(is_handled(r) for r in summary_results):
-            if subtask.get("dueStatus", {}).get("key") != "COMPLETE":
-                print(f"✔ Marking subtask {subtask_id} as complete")
-                update_subtask_status(subtask_id)
+    for subtask_id in subtasks_to_complete:
+        print(f"✔ Marking subtask {subtask_id} as complete")
+        update_subtask_status(subtask_id)
 
     task_completed = check_and_complete_task_if_all_subtasks_done(task_id)
 

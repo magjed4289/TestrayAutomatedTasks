@@ -152,7 +152,7 @@ your-workspace/
 From the root of the `TestrayAutomatedTasks` directory:
 
 ```bash
-pip install -r utils/requirements.txt
+pip install -r requirements.txt
 ```
 
 ---

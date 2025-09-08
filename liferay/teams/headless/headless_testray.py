@@ -73,19 +73,18 @@ def analyze_testflow(jira_connection):
             continue
 
         summary_results = get_subtask_case_results(subtask_id)
-
         if not summary_results:
             continue
 
         all_results_in_subtask_handled = True
         first_result = True
-        for summary_result in summary_results:
-            len_before = len(batch_updates)
+        subtask_unique_failures = []
 
+        for summary_result in summary_results:
             result_handled, flaky_info, is_blocked_unique = process_summary_result(
                 summary_result=summary_result,
+                task_id=task_id,
                 subtask_id=subtask_id,
-                summary_results=summary_results,
                 first_result=first_result,
                 latest_build_id=latest_build_id,
                 jira_conn=jira_connection,
@@ -97,17 +96,34 @@ def analyze_testflow(jira_connection):
                 total_flaky_without_issue=total_flaky_without_issue,
                 history_cache=case_history_cache,
             )
-
             first_result = False
 
-            new_issue_assigned = len(batch_updates) > len_before
-
             if is_blocked_unique:
-                total_unique += 1
+                subtask_unique_failures.append({
+                    "error": summary_result["errors"],
+                    "subtask_id": subtask_id,
+                    "case_id": summary_result["r_caseToCaseResult_c_caseId"],
+                    "result_id": summary_result["id"]
+                })
 
-            # A result is considered "handled" if it was already handled, or if we just assigned an issue.
-            if not (result_handled or is_blocked_unique or new_issue_assigned):
-                all_results_in_subtask_handled = False
+        # ✅ Create one Jira issue per subtask after collecting all unique results
+        if subtask_unique_failures:
+            issue = create_investigation_task_for_subtask(
+                subtask_unique_failures=subtask_unique_failures,
+                subtask_id=subtask_id,
+                latest_build_id=latest_build_id,
+                jira_connection=jira_connection,
+                epic=epic,
+                task_id=task_id,
+                case_history_cache=case_history_cache,
+            )
+
+            for failure in subtask_unique_failures:
+                batch_updates.append({
+                    "id": failure["result_id"],
+                    "dueStatus": {"key": "BLOCKED", "name": "Blocked"},
+                    "issues": issue.key
+                })
 
         if all_results_in_subtask_handled:
             subtasks_to_complete.append(subtask_id)
@@ -118,6 +134,8 @@ def analyze_testflow(jira_connection):
     for subtask_id in subtasks_to_complete:
         print(f"✔ Marking subtask {subtask_id} as complete")
         update_subtask_status(subtask_id)
+
+
 
     task_completed = check_and_complete_task_if_all_subtasks_done(task_id)
 

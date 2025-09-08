@@ -9,6 +9,7 @@ class ComponentMapping:
         "Headless Batch Engine API": "Headless Batch Engine API",
         "Headless Discovery Application": "Headless Discovery Application",
         "Job Scheduler": "Data Integration > Job Scheduler",
+        "Object": "Objects > Object Entries REST APIs",
         "Object Entries REST APIs": "Objects > Object Entries REST APIs",
         "REST Builder": "REST Builder",
         "REST Infrastructure": "REST Infrastructure",

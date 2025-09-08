@@ -98,6 +98,49 @@ def create_investigation_task_for(jira_local, summary, description, component, e
     print(f"Created new investigation task: {new_issue.key}")
     return new_issue
 
+def create_investigation_task_for_unique_failure(
+        jira_local,
+        epic,
+        summary,
+        description,
+        component
+):
+    """
+    Creates a Jira investigation task for unique failures.
+    Component can now be a single string or a list of strings.
+    """
+
+    # Ensure components is always a list of dicts
+    if isinstance(component, str):
+        components_list = [{"name": component}]
+    elif isinstance(component, list):
+        if all(isinstance(c, dict) for c in component):
+            components_list = component
+        else:
+            components_list = [{"name": c} for c in component]
+
+    issue_dict = {
+        "project": {"key": "LPD"},
+        "summary": summary,
+        "description": description,
+        "parent": {"id": epic.id},
+        "issuetype": {"name": IssueTypes.Task},
+        "components": components_list
+    }
+
+    print("ISSUE DICT")
+    print(issue_dict)
+
+    new_issue = jira_local.create_issue(fields=issue_dict)
+
+    jira_local.issue(new_issue.key).update(
+        update={
+            "labels": [{"add": "hl_routine_tasks"}]
+        }
+    )
+
+    return new_issue
+
 def create_poshi_automation_task_for(jira_local, issue, summary, description):
     new_issue = ''
     if not has_linked_task_with_summary(issue, summary):
@@ -147,6 +190,26 @@ def get_all_issues(jira_local, jql_str, fields):
         if i >= chunk.total:
             break
     return issues
+
+def get_issue_by_key(jira_local, issue_key):
+    """
+    Retrieves a Jira issue by key, prints the full JSON, and returns the issue object.
+
+    :param jira_local: Authenticated Jira connection.
+    :param issue_key: The key of the issue (e.g., "LPD-12345").
+    :return: Jira issue object if found, else None
+    """
+    try:
+        # By default, all fields are retrieved
+        issue = jira_local.issue(issue_key)
+
+        # Print full JSON of the issue
+        print(json.dumps(issue.raw, indent=4))
+
+        return issue
+    except Exception as e:
+        print(f"Error retrieving issue {issue_key}: {str(e)}")
+        return None
 
 def get_issue_status_by_key(jira_local, issue_key):
     """

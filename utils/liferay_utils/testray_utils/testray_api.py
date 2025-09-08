@@ -52,7 +52,7 @@ HEADERS = {
 
 HEADERS2 = {
     "Cookie": f"JSESSIONID={SESSION_ID}",
-    "x-csrf-token": {CSRF_TOKEN},
+    "x-csrf-token": CSRF_TOKEN,
     "Accept": "application/json"
 }
 # Status filters

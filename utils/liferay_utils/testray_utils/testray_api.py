@@ -10,12 +10,17 @@ from pathlib import Path
 
 # ------------------------ AUTH CONFIG ------------------------
 
-env_path = Path(__file__).resolve().parents[3].parent / ".automated_tasks.env"
-
-load_dotenv(dotenv_path=env_path)
-
+# Try to get from environment variables first
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+
+# If any are missing, load from local .env file (for local dev)
+if not all([CLIENT_ID, CLIENT_SECRET]):
+    env_path = Path(__file__).resolve().parents[3].parent / ".automated_tasks.env"
+    load_dotenv(dotenv_path=env_path)
+
+    CLIENT_ID = os.getenv("CLIENT_ID")
+    CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 
 TOKEN_URL = "https://testray.liferay.com/o/oauth2/token"
 

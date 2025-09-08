@@ -5,15 +5,14 @@ from Crypto.PublicKey import RSA
 from Crypto.Cipher import PKCS1_OAEP
 from os.path import expanduser
 from shutil import rmtree
+import os
+import sys
 
 FOLDER_NAME = ".jira_user"
 
-
-from pathlib import Path
-
 def delete_credentials():
     home = Path.home()
-    folder = home / ".jira_user"
+    folder = home / FOLDER_NAME
 
     files_to_delete = [
         folder / "token.enc",
@@ -77,6 +76,19 @@ def generate_rsa_keypair(folder: Path):
     print(f"RSA key pair generated in {folder}")
 
 def get_credentials():
+    """
+    Hybrid mode:
+      - First try GitHub Actions secrets (env variables JIRA_USER, JIRA_TOKEN)
+      - If not present, fallback to ~/.jira_user encrypted storage
+    """
+    env_user = os.getenv("USER")
+    env_token = os.getenv("TOKEN")
+
+    if env_user and env_token:
+        # Running in GitHub Actions (or with exported envs locally)
+        return env_user, env_token
+
+    # Otherwise, fallback to ~/.jira_user
     home = Path(expanduser("~"))
     folder = home / FOLDER_NAME
     path_to_user = folder / "user"
@@ -91,7 +103,7 @@ def get_credentials():
     # Now validate required credential files
     if not (path_to_user.is_file() and priv_key_path.is_file() and path_to_token_enc.is_file()):
         print(f"Missing required credential files in {folder}.")
-        exit(1)
+        sys.exit(1)
 
     with open(path_to_user, 'r') as f:
         username = f.read().strip()
@@ -109,8 +121,8 @@ def get_credentials():
     return username, token
 
 if __name__ == "__main__":
-    print("Set the credentials to be used when accessing jira.")
+    print("Set the credentials to be used when accessing Jira.")
     delete_credentials()
     encrypt_and_store_token()
-    get_credentials()
-    print("Credentials set.")
+    user, token = get_credentials()
+    print(f"Credentials set. User: {user}")

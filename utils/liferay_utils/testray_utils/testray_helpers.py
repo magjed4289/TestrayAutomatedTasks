@@ -147,7 +147,7 @@ def get_batch_info(case_name, case_type_name):
         return "functional-tomcat101-postgresql163", case_name
     elif case_type_name == "Modules Integration Test":
         trimmed_name = case_name.split(".")[-1]
-        return "modules-integration-postgresql163", f"**/src/testIntegration/**/{trimmed_name}.java"
+        return "modules-integration-postgresql163", f"\\*\\*/src/testIntegration/\\*\\*/{trimmed_name}.java"
     return None, None
 
 

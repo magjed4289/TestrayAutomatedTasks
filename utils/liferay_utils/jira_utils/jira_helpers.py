@@ -12,6 +12,58 @@ LIFERAY_JIRA_BROWSE_URL = Instance.Jira_URL + "/browse/"
 LIFERAY_JIRA_ISSUES_URL = Instance.Jira_URL + "/issues/"
 
 
+
+def create_investigation_task_for_unique_failure(
+    jira_local,
+    epic,
+    summary,
+    description,
+    component
+):
+    """
+    Creates a Jira investigation task for unique failures.
+    Component can now be a single string or a list of strings.
+    Removes invalid components like "Headless".
+    """
+
+    # Normalize input into list of dicts
+    if isinstance(component, str):
+        components_list = [{"name": component}]
+    elif isinstance(component, list):
+        if all(isinstance(c, dict) for c in component):
+            components_list = component
+        else:
+            components_list = [{"name": c} for c in component]
+    else:
+        components_list = []
+
+    # Filter out "Headless"
+    components_list = [c for c in components_list if c["name"] != "Headless"]
+
+    issue_dict = {
+        "project": {"key": "LPD"},
+        "summary": summary,
+        "description": description,
+        "parent": {"id": epic.id},
+        "issuetype": {"name": IssueTypes.Task},
+    }
+
+    # Only include components if something valid remains
+    if components_list:
+        issue_dict["components"] = components_list
+
+    print("ISSUE DICT")
+    print(issue_dict)
+
+    new_issue = jira_local.create_issue(fields=issue_dict)
+
+    jira_local.issue(new_issue.key).update(
+        update={
+            "labels": [{"add": "hl_routine_tasks"}]
+        }
+    )
+    return new_issue
+
 def __initialize_subtask(story, components, summary, issuetype, description=''):
     subtask_test_automation = {
         'project': {'key': 'LPD'},
@@ -98,48 +150,6 @@ def create_investigation_task_for(jira_local, summary, description, component, e
     print(f"Created new investigation task: {new_issue.key}")
     return new_issue
 
-def create_investigation_task_for_unique_failure(
-        jira_local,
-        epic,
-        summary,
-        description,
-        component
-):
-    """
-    Creates a Jira investigation task for unique failures.
-    Component can now be a single string or a list of strings.
-    """
-
-    # Ensure components is always a list of dicts
-    if isinstance(component, str):
-        components_list = [{"name": component}]
-    elif isinstance(component, list):
-        if all(isinstance(c, dict) for c in component):
-            components_list = component
-        else:
-            components_list = [{"name": c} for c in component]
-
-    issue_dict = {
-        "project": {"key": "LPD"},
-        "summary": summary,
-        "description": description,
-        "parent": {"id": epic.id},
-        "issuetype": {"name": IssueTypes.Task},
-        "components": components_list
-    }
-
-    print("ISSUE DICT")
-    print(issue_dict)
-
-    new_issue = jira_local.create_issue(fields=issue_dict)
-
-    jira_local.issue(new_issue.key).update(
-        update={
-            "labels": [{"add": "hl_routine_tasks"}]
-        }
-    )
-
-    return new_issue
 
 def create_poshi_automation_task_for(jira_local, issue, summary, description):
     new_issue = ''

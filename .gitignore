@@ -15,3 +15,5 @@
 /myenv/
 /venv/
 /liferay/teams/headless/reports/combined_report.html
+/.venv/
+/liferay/teams/headless/reports/before_refactor.html

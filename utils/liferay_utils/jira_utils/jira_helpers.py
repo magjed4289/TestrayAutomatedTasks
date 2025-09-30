@@ -12,58 +12,6 @@ LIFERAY_JIRA_BROWSE_URL = Instance.Jira_URL + "/browse/"
 LIFERAY_JIRA_ISSUES_URL = Instance.Jira_URL + "/issues/"
 
 
-
-def create_investigation_task_for_unique_failure(
-    jira_local,
-    epic,
-    summary,
-    description,
-    component
-):
-    """
-    Creates a Jira investigation task for unique failures.
-    Component can now be a single string or a list of strings.
-    Removes invalid components like "Headless".
-    """
-
-    # Normalize input into list of dicts
-    if isinstance(component, str):
-        components_list = [{"name": component}]
-    elif isinstance(component, list):
-        if all(isinstance(c, dict) for c in component):
-            components_list = component
-        else:
-            components_list = [{"name": c} for c in component]
-    else:
-        components_list = []
-
-    # Filter out "Headless"
-    components_list = [c for c in components_list if c["name"] != "Headless"]
-
-    issue_dict = {
-        "project": {"key": "LPD"},
-        "summary": summary,
-        "description": description,
-        "parent": {"id": epic.id},
-        "issuetype": {"name": IssueTypes.Task},
-    }
-
-    # Only include components if something valid remains
-    if components_list:
-        issue_dict["components"] = components_list
-
-    print("ISSUE DICT")
-    print(issue_dict)
-
-    new_issue = jira_local.create_issue(fields=issue_dict)
-
-    jira_local.issue(new_issue.key).update(
-        update={
-            "labels": [{"add": "hl_routine_tasks"}]
-        }
-    )
-    return new_issue
-
 def __initialize_subtask(story, components, summary, issuetype, description=''):
     subtask_test_automation = {
         'project': {'key': 'LPD'},
@@ -120,6 +68,24 @@ def _parse_permission(permissions):
         parsed_permission.append(current_permission)
     return parsed_permission
 
+def close_issue(jira_local, issue, build_hash):
+    """
+    Closes a Jira issue with a 'Discarded' resolution and adds a comment.
+    """
+    try:
+        # Find the 'Closed' transition ID, as the API requires the ID, not the name.
+        transitions = jira_local.transitions(issue)
+        close_transition = next((t for t in transitions if t['name'] == Transition.Closed), None)
+
+        if close_transition:
+            jira_local.transition_issue(issue, transition=close_transition['id'], resolution={'name': 'Discarded'})
+            comment = f"Closing. Not reproducible in current SHA {build_hash}"
+            jira_local.add_comment(issue, comment)
+            print(f"✔ Closed issue {issue} as it was not reproducible in SHA {build_hash}.")
+        else:
+            print(f"✘ Could not find 'Closed' transition for issue {issue}.")
+    except Exception as e:
+        print(f"✘ Failed to close issue {issue}: {e}")
 
 def close_functional_automation_subtask(jira_local, story, poshi_task=''):
     for subtask in story.get_field('subtasks'):
@@ -150,6 +116,60 @@ def create_investigation_task_for(jira_local, summary, description, component, e
     print(f"Created new investigation task: {new_issue.key}")
     return new_issue
 
+def create_jira_task(
+        jira_local,
+        epic,
+        summary,
+        description,
+        component,
+        label
+):
+    """
+    Creates a Jira investigation task for unique failures.
+    `component` can be:
+      - a single string
+      - a list of strings
+      - a list of dicts
+      - None (defaults to no components)
+    """
+
+    # Normalize components into the correct format
+    components_list = []
+    if isinstance(component, str):
+        components_list = [{"name": component}]
+    elif isinstance(component, list):
+        if all(isinstance(c, dict) for c in component):
+            components_list = component
+        else:
+            components_list = [{"name": str(c)} for c in component]
+    elif component is None:
+        components_list = []
+    else:
+        raise TypeError(
+            f"Invalid type for component: {type(component).__name__}. "
+            "Must be str, list, or None."
+        )
+
+    issue_dict = {
+        "project": {"key": "LPD"},
+        "summary": summary,
+        "description": description,
+        "parent": {"id": epic.id},
+        "issuetype": {"name": IssueTypes.Task},
+        "components": components_list,
+    }
+
+    new_issue = jira_local.create_issue(fields=issue_dict)
+
+    jira_local.issue(new_issue.key).update(
+        update={"labels": [{"add": "hl_routine_tasks"}]}
+    )
+    if label:
+        jira_local.issue(new_issue.key).update(
+            update={"labels": [{"add": label}]}
+        )
+
+    return new_issue
 
 def create_poshi_automation_task_for(jira_local, issue, summary, description):
     new_issue = ''

@@ -288,7 +288,7 @@ def get_routine_to_builds():
 
 def get_subtask_case_results(subtask_id):
     """Get case results under a subtask."""
-    url = f"{BASE_URL}/subtasks/{subtask_id}/subtaskToCaseResults?fields=id,executionDate,errors,issues,r_caseToCaseResult_c_caseId"
+    url = f"{BASE_URL}/subtasks/{subtask_id}/subtaskToCaseResults?fields=id,executionDate,errors,issues,r_caseToCaseResult_c_caseId,r_componentToCaseResult_c_componentId"
     return get_json(url).get("items", [])
 
 
@@ -324,14 +324,19 @@ def reanalyze_task(task_id):
     return response.json()
 
 
-def update_subtask_status(subtask_id):
+from typing import Dict, Any, Optional
+
+def update_subtask_status(subtask_id: str, issues: Optional[str] = None) -> None:
     """Mark a subtask as complete."""
     url = f"{BASE_URL}/subtasks/{subtask_id}"
-    payload = {
+    payload: Dict[str, Any] = {
         "dueStatus": {
             "key": "COMPLETE",
             "name": "Complete"
         }
     }
+    if issues:
+        payload["issues"] = issues
+
     put_json(url, payload)
     print(f"Subtask {subtask_id} marked as COMPLETE.")

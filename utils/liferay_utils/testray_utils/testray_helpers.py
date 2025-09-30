@@ -10,11 +10,39 @@ from html import escape
 from sentence_transformers import SentenceTransformer, util
 
 from liferay.teams.headless.headless_contstants import ComponentMapping
-from utils.liferay_utils.jira_utils.jira_helpers import get_issue_status_by_key, get_issue_by_key, create_investigation_task_for_unique_failure
+from utils.liferay_utils.jira_utils.jira_helpers import get_issue_status_by_key, get_issue_by_key, create_jira_task, get_all_issues, close_issue
 from utils.liferay_utils.testray_utils.testray_api import *
 from utils.liferay_utils.utilities import *
 
 model = SentenceTransformer('all-MiniLM-L6-v2')
+
+def handle_flaky_result(latest_build_id, jira_connection, result, case_id, result_error, epic):
+    similar_open_issues = find_similar_open_issues(jira_connection, case_id, result_error, return_list=True)
+
+    if similar_open_issues:
+        print(f"Similar open issues: {similar_open_issues}")
+        print(f"✔ Reassigning open issues {', '.join(similar_open_issues)} to result {result['id']}")
+        return True, {
+            "id": result["id"],
+            "dueStatus": {"key": "TESTFIX", "name": "Test Fix"},
+            "issues": ", ".join(similar_open_issues)
+        }, None
+
+    # Always create a new Test Fix task if none exist
+    print("WE NEED TO CREATE SUBTASK: ")
+    issue = create_testfix_task_for_subtask(
+        case_id=case_id,
+        latest_build_id=latest_build_id,
+        jira_connection=jira_connection,
+        epic=epic,
+        result=result,
+        result_error=result_error,
+    )
+    return True, {
+        "id": result["id"],
+        "dueStatus": {"key": "TESTFIX", "name": "Test Fix"},
+        "issues": issue.key
+    }, issue
 
 def process_summary_result(
         summary_result,
@@ -27,7 +55,6 @@ def process_summary_result(
         unique_tasks,
         case_ids,
         case_id_to_result,
-        total_flaky_without_issue,
         history_cache,
         task_id
 ):
@@ -50,37 +77,21 @@ def process_summary_result(
     if existing_issue:
         return True, None, False
 
-    is_flaky = detect_flakiness(case_id, result_error_norm, history_cache)
+    if is_module_integration_test(case_id):
+        is_flaky = False
+    else:
+        is_flaky = detect_flakiness(case_id, result_error_norm, history_cache)
 
     if is_flaky:
         handled, update_data, info = handle_flaky_result(
-            latest_build_id, jira_conn, summary_result, case_id, result_error
+            latest_build_id, jira_conn, summary_result, case_id, result_error, epic
         )
-        if handled:
-            batch_updates.append(update_data)
-            return True, None, False
-        total_flaky_without_issue.append(info)
-        return False, info, False  # still record flaky info for reporting
+        batch_updates.append(update_data)
+        return True, None, False
 
-    # --- Handle unique ---
-    # ✅ Just collect for subtask-level processing, no issue creation here
     add_to_unique_tasks(unique_tasks, subtask_id, case_id, result_error)
     case_ids.add(case_id)
     return False, summary_result, True
-
-def print_error_header(error, subtask_case_pairs, task_id, case_id_to_result):
-    first_subtask_id = subtask_case_pairs[0][0]
-    subtask_url = f"https://testray.liferay.com/web/testray#/testflow/{task_id}/subtasks/{first_subtask_id}"
-    print(f"\n🔗 {subtask_url}")
-    print(f"💨 Error:\n{error}\n")
-
-    first_case_id = subtask_case_pairs[0][1]
-    if is_module_integration_test(first_case_id):
-        result = case_id_to_result.get(first_case_id)
-        error_link = get_error_messages_link(result) if result else None
-        if error_link:
-            print(f"🔗 Error Messages Link: {error_link}\n")
-
 
 def sort_cases_by_duration(subtask_case_pairs, case_duration_lookup):
     def safe_duration(c_id):
@@ -97,20 +108,17 @@ def build_case_rows(sorted_cases, case_duration_lookup, build_id, history_cache)
     rca_selector = None
     rca_compare = None
 
-    header = f"{'Case Name':<150} {'Duration':<15} {'Component Name':<30}"
-    #print(header)
-    #print("-" * (len(header) + 5))
-
     failing_hash = get_current_build_hash(build_id)
 
-    for _, case_id in sorted_cases:
+    component_name = "Unknown"
+
+    for _, case_id, component_id in sorted_cases:
         try:
             case_info = get_case_info(case_id)
             case_name = case_info.get("name", "N/A")
-            component_id = case_info.get("r_componentToCases_c_componentId")
-            component_name = get_component_name(component_id) if component_id else "Unknown"
             case_type_id = case_info.get("r_caseTypeToCases_c_caseTypeId")
             case_type_name = get_case_type_name(case_type_id) if case_type_id else "Unknown"
+            component_name = get_component_name(component_id) if component_id else "Unknown"
             raw_duration = case_duration_lookup.get(int(case_id))
             duration = raw_duration if isinstance(raw_duration, (int, float)) else None
             passing_hash = get_last_passing_git_hash(case_id, build_id, history_cache)
@@ -136,7 +144,7 @@ def build_case_rows(sorted_cases, case_duration_lookup, build_id, history_cache)
         except Exception as e:
             print(f"[ERROR] Failed to fetch data for case_id={case_id} → {e}")
 
-    return printed_rows, rca_info, rca_batch, rca_selector, rca_compare
+    return printed_rows, rca_info, rca_batch, rca_selector, rca_compare, component_name
 
 
 def get_batch_info(case_name, case_type_name):
@@ -206,7 +214,7 @@ def get_latest_done_build(builds):
     return latest_build
 
 
-def find_or_create_task(build):
+def find_or_create_task(build, jira_connection, latest_build_id):
     build_to_tasks = get_build_tasks(build["id"])
 
     if not build_to_tasks:
@@ -222,7 +230,8 @@ def find_or_create_task(build):
             return None
         print(f"[USE] Using existing task {task['id']} with status {due_status_key}.")
         task_id = task["id"]
-        if check_and_complete_task_if_all_subtasks_done(task_id):
+        subtasks = get_task_subtasks(task_id)
+        if check_and_complete_task_if_all_subtasks_done(task_id,subtasks,jira_connection, latest_build_id):
             return None
         return task_id
     return None
@@ -262,23 +271,57 @@ def build_flaky_result_metadata(latest_build_id,result, case_id, result_error):
         "component": get_component_name(case_info.get("r_componentToCases_c_componentId")) or "Unknown"
     }
 
-def handle_flaky_result(latest_build_id,jira_connection, result, case_id, result_error):
-    similar_open_issues = find_similar_open_issues(jira_connection, case_id, result_error, return_list=True)
+def create_testfix_task_for_subtask(
+        case_id,
+        latest_build_id,
+        jira_connection,
+        epic,
+        result,
+        result_error
+):
+    """
+    Creates a Test Fix task in Jira when a flaky result is detected and
+    no similar open issues exist. It includes context about the failing case,
+    component, and error for quicker triage.
+    """
 
-    if is_module_integration_test(case_id):
-        return handle_module_integration_flaky(latest_build_id,result, case_id, result_error, similar_open_issues)
+    case_info = get_case_info(case_id)
+    component_name = get_component_name(case_info.get("r_componentToCases_c_componentId")) or "Unknown"
 
-    if similar_open_issues:
-        print(f"Similar open issues: {similar_open_issues}")
-        print(f"✔ Reassigning open issues {', '.join(similar_open_issues)} to result {result['id']}")
-        return True, {
-            "id": result["id"],
-            "dueStatus": {"key": "TESTFIX", "name": "Test Fix"},
-            "issues": ", ".join(similar_open_issues)
-        }, None
+    # Build description
+    description_lines = [
+        "*Flaky Test Detected in Testray*",
+        f"[Testray Result|https://testray.liferay.com/web/testray#/project/35392/routines/{HEADLESS_ROUTINE_ID}/build/{latest_build_id}/case-result/{result['id']}]",
+        "",
+        "h3. Error",
+        f"{{code}}{result_error}{{code}}",
+        "",
+        "h3. Test Details",
+        f"*Name:* {case_info.get('name', 'N/A')}",
+        f"*Component:* {component_name}",
+        f"*Result ID:* {result['id']}",
+    ]
 
-    return False, None, build_flaky_result_metadata(latest_build_id,result, case_id, result_error)
+    summary = f"Test Fix: {case_info.get('name', 'N/A')} - {result_error[:80]}"
+    description = "\n".join(description_lines)
 
+    jira_components = [
+        ComponentMapping.TestrayToJira.get(component_name, component_name)
+    ]
+
+    # Create Jira issue
+    issue = create_jira_task(
+        jira_local=jira_connection,
+        epic=epic,
+        summary=summary,
+        description=description,
+        component=jira_components,
+        label="test_fix"
+    )
+
+    print(f"✔ Created Test Fix task for case {case_id}: {issue.key}")
+
+    return issue
 
 def find_similar_open_issues(jira_connection, case_id, result_error, *, return_list=False):
     """
@@ -317,8 +360,6 @@ def find_similar_open_issues(jira_connection, case_id, result_error, *, return_l
                 _, status = get_issue_status_by_key(jira_connection, issue_key)
                 if status != "Closed":
                     open_issues.append(issue_key)
-                    if issue_key == "LPD-55856":
-                        get_issue_by_key(jira_connection, issue_key)
                 seen_issues.add(issue_key)
             except Exception as e:
                 print(f"Error retrieving issue {issue_key}: {e}")
@@ -463,24 +504,37 @@ def is_module_integration_test(c_id):
     return get_case_type_name(case_type_id) == "Modules Integration Test"
 
 
-def check_and_complete_task_if_all_subtasks_done(task_id):
-    subtasks = get_task_subtasks(task_id)
+def check_and_complete_task_if_all_subtasks_done(task_id, subtasks, jira_connection, latest_build_id):
     all_complete = all(subtask.get("dueStatus", {}).get("key") == "COMPLETE" for subtask in subtasks)
 
     if all_complete:
+        # Collect all unique issue keys from the completed subtasks
+        testray_issue_keys = set()
+        for subtask in subtasks:
+            issues_str = subtask.get("issues", "")
+            if issues_str:
+                testray_issue_keys.update(key.strip() for key in issues_str.split(','))
+
+        # Fetch open routine tasks from Jira
+        jql = "labels in ('hl_routine_tasks') AND labels not in ('test_fix') AND status = Open"
+        open_jira_issues = get_all_issues(jira_connection, jql, fields=["key"])
+        open_jira_issue_keys = {issue.key for issue in open_jira_issues}
+
+        # Find issues that are open in Jira but not present in our completed TestRay task
+        issues_to_close = open_jira_issue_keys - testray_issue_keys
+
+        if issues_to_close:
+            build_hash = get_current_build_hash(latest_build_id)
+            print(f"ℹ Found {len(issues_to_close)} issues to close as they are not reproducible in this run.")
+            for issue_key in issues_to_close:
+                close_issue(jira_connection, issue_key, build_hash)
+
         print(f"✔ All subtasks are complete, completing task {task_id}")
         complete_task(task_id)
         return True  # Task completed
     else:
         print(f"ℹ Not all subtasks are complete for task {task_id}, task remains in progress")
         return False  # Task still open
-
-
-def print_summary_report(total_reused, total_unique, total_flaky_without_issue):
-    print("\n--- Summary Report ---")
-    print(f"Total issues reassigned from previous builds: {total_reused}")
-    print(f"Total unique tasks: {total_unique}")
-    print(f"Total flaky tests without open Jira issue: {len(total_flaky_without_issue)}")
 
 def are_errors_similar(current_norm, history_norm, threshold=0.8):
     """
@@ -508,7 +562,7 @@ def are_errors_similar(current_norm, history_norm, threshold=0.8):
 def group_errors_by_type(unique_tasks):
     error_to_cases = defaultdict(list)
     for item in unique_tasks:
-        error_to_cases[item["error"]].append((item["subtask_id"], item["case_id"]))
+        error_to_cases[item["error"]].append((item["subtask_id"], item["case_id"], item["component_id"]))
     return error_to_cases
 
 
@@ -674,9 +728,10 @@ def create_investigation_task_for_subtask(
         "",
     ]
 
-    all_components = set()
     first_error = None
     rca_included = False
+
+    component_name = None
 
     for error, subtask_case_pairs in error_to_cases.items():
         if not first_error:
@@ -686,7 +741,7 @@ def create_investigation_task_for_subtask(
         description_lines.append(f"{{code}}{error}{{code}}")  # code block for error
 
         sorted_cases = sort_cases_by_duration(subtask_case_pairs, case_duration_lookup)
-        printed_rows, rca_info, batch_name, test_selector, github_compare = build_case_rows(
+        printed_rows, rca_info, batch_name, test_selector, github_compare, component_name = build_case_rows(
             sorted_cases, case_duration_lookup, latest_build_id, case_history_cache
         )
 
@@ -695,8 +750,6 @@ def create_investigation_task_for_subtask(
         for row in printed_rows:
             name, duration, component = row
             description_lines.append(f"| {name} | {component} | {duration} |")  # table rows
-            if component:
-                all_components.add(component)
 
         # Blank line
         description_lines.append("")
@@ -714,143 +767,19 @@ def create_investigation_task_for_subtask(
     description = "\n".join(description_lines)
     jira_components = [
         ComponentMapping.TestrayToJira.get(c, c)  # fallback to original if not mapped
-        for c in sorted(all_components)
+        for c in component_name.split(",")
     ]
 
     # Create Jira issue
-    issue = create_investigation_task_for_unique_failure(
+    issue = create_jira_task(
         jira_local=jira_connection,
         epic=epic,
         summary=summary,
         description=description,
-        component=jira_components
+        component=jira_components,
+        label=None
     )
 
     print(f"✔ Created investigation task for subtask {subtask_id}: {issue.key}")
 
     return issue
-
-def generate_combined_html_report(flaky_tests, unique_tasks, task_id, case_id_to_result, build_id, output_path="combined_report.html", history_cache=None):
-    if history_cache is None:
-        history_cache = {}
-
-    html = [
-        "<html>",
-        "<head><meta charset='UTF-8'><title>Testray Flaky and Unique Failures Report</title>",
-        "<style>",
-
-        # --- GLOBAL LAYOUT & THEMING ---
-        "body { font-family: Arial, sans-serif; padding: 20px; background-color: #f9f9f9; }",
-        ".grid { display: grid; grid-template-columns: 1fr; gap: 30px; }",
-
-        # --- MAIN CARDS (wrappers) ---
-        ".card { background-color: #ffffff; border-left: 8px solid #0b5fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.1); }",
-        ".card.flaky { border-left-color: #2e6c80; }",
-        ".card.unique { border-left-color: #0b5fff; }",
-
-        # --- SUBCARDS (inside cards) ---
-        ".subcard { background-color: #f9fbff; border: 1px solid #d3e3fd; border-radius: 6px; padding: 15px; margin-top: 20px; box-shadow: 0 1px 4px rgba(0,0,0,0.05); }",
-        ".subcard.flaky { border-left: 4px solid #2e6c80; }",
-        ".subcard.unique { border-left: 4px solid #0b5fff; }",
-
-        # --- HEADINGS ---
-        "h2, h3 { margin-top: 0; }",
-        "h2.flaky-title { color: #2e6c80; }",
-        "h2.unique-title { color: #0b5fff; }",
-
-        # --- TABLES ---
-        "table { border-collapse: collapse; width: 100%; margin-top: 10px; }",
-        "th { background-color: #e6f0ff; color: #0b5fff; }",
-        "td, th { border: 1px solid #ccc; padding: 8px; text-align: left; }",
-        "tr:nth-child(even) { background-color: #f4faff; }",
-        "tr:hover { background-color: #edf4fb; }",
-
-        # --- CODE BLOCKS & ERROR SNIPPETS ---
-        "code { background-color: #eef5fa; padding: 2px 4px; border-radius: 3px; font-size: 90%; }",
-        "pre { background-color: #f4faff; padding: 10px; border-left: 4px solid #50c8b0; border-radius: 4px; }",
-
-        # --- LINKS ---
-        "a { color: #0b5fff; text-decoration: none; }",
-        "a:hover { text-decoration: underline; }",
-
-        "</style>",
-        "</head>",
-        "<body>",
-        "<div class='grid'>",  # Grid layout wrapper
-
-        # ✅ Only one Flaky card starts here:
-        "<div class='card flaky'>",
-        "<h2 class='flaky-title'>Flaky Tests Without Jira Issue</h2>"
-    ]
-
-    if flaky_tests:
-        for flaky in flaky_tests:
-            html.append("<div class='subcard flaky'>")
-            html.append("<table><tr><th>Test Name</th><th>Error</th><th>Component</th><th>Link</th></tr>")
-            html.append(
-                f"<tr><td>{escape(flaky['test_name'])}</td>"
-                f"<td><code>{escape(flaky['error'])}</code></td>"
-                f"<td>{escape(flaky['component'])}</td>"
-                f"<td><a href='{flaky['link']}' target='_blank'>View Result</a></td></tr>"
-            )
-            html.append("</table>")
-            html.append("</div>")  # End subcard
-    else:
-        html.append("<p>No flaky tests without Jira issue found.</p>")
-
-    html.append("</div>")  # End Flaky Card
-
-
-    # Grouped Unique Errors Section
-    html.append("<div class='card unique'>")
-    html.append("<h2 class='unique-title'>Grouped Unique Errors</h2>")
-
-    # Build case blocks per unique error
-    error_to_cases = group_errors_by_type(unique_tasks)
-    case_duration_lookup = build_case_duration_lookup(unique_tasks, build_id)
-
-    for error, subtask_case_pairs in error_to_cases.items():
-        sorted_cases = sort_cases_by_duration(subtask_case_pairs, case_duration_lookup)
-        printed_rows, rca_info, batch_name, test_selector, github_compare = build_case_rows(
-            sorted_cases, case_duration_lookup, build_id, history_cache
-        )
-
-        html.append("<div class='subcard unique'>")
-
-        html.append(f"<h3>Error</h3><pre>{escape(error)}</pre>")
-
-        if subtask_case_pairs:
-            first_subtask_id = subtask_case_pairs[0][0]
-            subtask_url = f"https://testray.liferay.com/web/testray#/testflow/{task_id}/subtasks/{first_subtask_id}"
-            html.append(f"<p><a href='{subtask_url}' target='_blank'>Testray Subtask</a></p>")
-
-        if is_module_integration_test(subtask_case_pairs[0][1]):
-            result = case_id_to_result.get(subtask_case_pairs[0][1])
-            error_link = get_error_messages_link(result) if result else None
-            if error_link:
-                html.append(f"<p><a href='{error_link}' target='_blank'>Failure Messages</a></p>")
-
-        html.append("<table><tr><th>Case Name</th><th>Duration</th><th>Component</th></tr>")
-        for row in printed_rows:
-            name, duration, component = map(escape, row)
-            html.append(f"<tr><td>{name}</td><td>{duration}</td><td>{component}</td></tr>")
-        html.append("</table>")
-
-        if batch_name and test_selector and github_compare:
-            html.append(build_rca_html_block(batch_name, test_selector, github_compare))
-
-        html.append("</div>")  # End subcard
-
-    html.append("</div>")  # End Unique Errors Main Card
-
-    # Final closing tags
-    html.append("</div>")  # End grid
-    html.append("</body></html>")
-
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(html))
-
-    # Automatically open in default browser
-    absolute_path = os.path.abspath(output_path)
-    webbrowser.open(f"file://{absolute_path}")

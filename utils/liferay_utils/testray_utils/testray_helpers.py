@@ -1,20 +1,429 @@
 #!/usr/bin/env python3
 
-import webbrowser
 import json
 from collections import defaultdict
-from datetime import time
-from html import escape
-
-
+from datetime import datetime, time  # FIX: datetime was used but not imported
 from sentence_transformers import SentenceTransformer, util
 
 from liferay.teams.headless.headless_contstants import ComponentMapping
-from utils.liferay_utils.jira_utils.jira_helpers import get_issue_status_by_key, get_issue_by_key, create_jira_task, get_all_issues, close_issue
+from utils.liferay_utils.jira_utils.jira_helpers import (
+    get_issue_status_by_key,
+    create_jira_task,
+    get_all_issues,
+    close_issue,
+)
 from utils.liferay_utils.testray_utils.testray_api import *
 from utils.liferay_utils.utilities import *
 
+# Heavy model loaded once here (not in entrypoint)
 model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# ---------------------------------------------------------------------------
+# Entry-point orchestration helpers
+# ---------------------------------------------------------------------------
+
+def get_latest_done_build(builds):
+    """Return the newest build only if its import status is DONE; else None."""
+    if not builds:
+        return None
+    latest_build = builds[0]
+    if latest_build.get("importStatus", {}).get("key") != "DONE":
+        print(f"✘ Latest build '{latest_build.get('name')}' is not DONE.")
+        return None
+    return latest_build
+
+
+def prepare_task(jira_connection, builds, latest_build):
+    """
+    Ensure a task exists for latest_build and is actionable.
+    Returns (task_id or None, latest_build_id).
+    """
+    latest_build_id = latest_build["id"]
+    build_to_tasks = get_build_tasks(latest_build_id)
+
+    if not build_to_tasks:
+        print(f"[CREATE] No tasks for build '{latest_build['name']}', creating task and testflow.")
+        task = create_task(latest_build)
+        create_testflow(task["id"])
+        print(f"✔ Using build {latest_build_id} and task {task['id']}")
+        return task["id"], latest_build_id
+
+    for task in build_to_tasks:
+        due_status_key = task.get("dueStatus", {}).get("key")
+        if due_status_key == "ABANDONED":
+            print(f"Task {task['id']} has been ABANDONED.")
+            return None, latest_build_id
+
+        print(f"[USE] Using existing task {task['id']} with status {due_status_key}.")
+        task_id = task["id"]
+
+        status = get_task_status(task_id)
+        if status.get("dueStatus", {}).get("key") == "COMPLETE":
+            print(f"✔ Task {task_id} for build {latest_build_id} is now complete. No further processing required.")
+            return None, latest_build_id
+
+        print(f"✔ Using build {latest_build_id} and task {task_id}")
+        return task_id, latest_build_id
+
+    return None, latest_build_id
+
+
+def _headless_epic_jql():
+    _, quarter_number, year = get_current_quarter_info()
+    return (
+        f"text ~ '{year} Milestone {quarter_number} \\\\| Testing activities \\\\[Headless\\\\]' "
+        f"and type = Epic and project='PUBLIC - Liferay Product Delivery' and status != Closed"
+    )
+
+
+def find_testing_epic(jira_connection):
+    jql = _headless_epic_jql()
+    related_epics = get_all_issues(jira_connection, jql, fields=["summary", "key"])
+    print(f"✔ Retrieved {len(related_epics)} related Epics from JIRA")
+
+    epic = related_epics[0] if len(related_epics) == 1 else None
+    if epic:
+        print(f"✔ Found testing epic: {epic}")
+    else:
+        print(f"✘ Expected 1 related epic, but found {len(related_epics)}")
+    return epic
+
+
+def maybe_autofill_from_previous(builds, latest_build):
+    """
+    If some previous build has a COMPLETED task, autofill into the latest build.
+    """
+    def _first_completed_build():
+        for b in builds:
+            for t in get_build_tasks(b["id"]):
+                if t.get("dueStatus", {}).get("key") == "COMPLETE":
+                    return b
+        return None
+
+    latest_complete = _first_completed_build()
+    if latest_complete:
+        print("Autofill from latest analysed build...")
+        autofill_build(latest_complete["id"], latest_build["id"])
+        print("✔ Completed")
+
+# ---------------------------------------------------------------------------
+# Subtask processing — scan → resolve (by error group) → stage → complete
+# ---------------------------------------------------------------------------
+
+def process_task_subtasks(*, task_id, latest_build_id, jira_connection, epic):
+    """
+    Iterate subtasks, detect unique failures grouped by error, reuse or create Jira tasks,
+    and build batched updates and completion list.
+    Returns (batch_updates, subtasks_to_complete, subtask_to_issues).
+    """
+    subtasks = get_task_subtasks(task_id)
+
+    batch_updates = []
+    subtasks_to_complete = []
+    subtask_to_issues = defaultdict(set)
+
+    for subtask in subtasks:
+        subtask_id = subtask["id"]
+        results = get_subtask_case_results(subtask_id)
+        if not results:
+            continue
+
+        # Always collect any pre-existing result-level issues so they get bubbled up
+        existing_issue_keys = _collect_result_issue_keys(results)
+        if existing_issue_keys:
+            subtask_to_issues[subtask_id].update(existing_issue_keys)
+
+        # 1) Handle already-complete subtasks (backfill issues once if needed)
+        if _is_subtask_complete(subtask):
+            _backfill_subtask_issues_if_needed(subtask_id, subtask, results)
+            continue
+
+        # 2) Scan current results for unique failures (skip known errors)
+        unique_failures, first_result_skipped = _scan_unique_failures(subtask_id, results)
+
+        # Group failures by normalized error so each group can map to its own issue(s)
+        groups = _group_failures_by_error(unique_failures)
+
+        resolved_all_groups = True
+        for error_key, group in groups.items():
+            updates, issues_str, resolved = _resolve_unique_failures(
+                jira_connection=jira_connection,
+                epic=epic,
+                latest_build_id=latest_build_id,
+                task_id=task_id,
+                subtask_id=subtask_id,
+                unique_failures=group,
+            )
+            batch_updates.extend(updates)
+            if issues_str:
+                subtask_to_issues[subtask_id].add(issues_str)
+            resolved_all_groups = resolved_all_groups and resolved
+
+        # 3) Decide if subtask is fully handled
+        no_unique_failures = len(unique_failures) == 0
+        all_handled = first_result_skipped or no_unique_failures or resolved_all_groups
+
+        # 4) Stage subtask for completion if everything is handled
+        if all_handled:
+            subtasks_to_complete.append(subtask_id)
+
+    return batch_updates, subtasks_to_complete, subtask_to_issues
+
+
+def finalize_task_completion(*, task_id, latest_build_id, jira_connection,
+                             subtasks_to_complete, subtask_to_issues, batch_updates):
+    """
+    Apply batched updates, complete subtasks, close stale Jira issues, and complete the task.
+    """
+    # Apply batched case result updates first (assign issues to results)
+    if batch_updates:
+        assign_issue_to_case_result_batch(batch_updates)
+
+    # Mark staged subtasks as COMPLETE (aggregating issues if provided)
+    for subtask_id in subtasks_to_complete:
+        issues_to_add = _join_issues(subtask_to_issues.get(subtask_id))
+        print(f"✔ Marking subtask {subtask_id} as complete and associating issues: {issues_to_add}")
+        update_subtask_status(subtask_id, issues=issues_to_add)
+
+    # Check if all subtasks are done
+    subtasks = get_task_subtasks(task_id)
+    if not all(s.get("dueStatus", {}).get("key") == "COMPLETE" for s in subtasks):
+        print(f"✔ Task {task_id} is not completed. Further processing required.")
+        return
+
+    # Close stale open routine tasks in Jira that were not reproduced in this run
+    seen_issue_keys = _collect_issue_keys_from_subtasks(subtasks)
+    _close_stale_routine_tasks(jira_connection, latest_build_id, seen_issue_keys)
+
+    print(f"✔ All subtasks are complete, completing task {task_id}")
+    complete_task(task_id)
+    print(f"✔ Task {task_id} is now complete. No further processing required.")
+
+# ---- scanning, grouping & resolving helpers -------------------------------------
+
+def _is_subtask_complete(subtask):
+    return subtask.get("dueStatus", {}).get("key") == "COMPLETE"
+
+
+def _backfill_subtask_issues_if_needed(subtask_id, subtask, results):
+    """
+    When a subtask is COMPLETE but the aggregated 'issues' field is empty,
+    aggregate from result-level 'issues' and write once.
+    """
+    if subtask.get("issues"):
+        return
+    issues = {r.get("issues") for r in results if r.get("issues")}
+    if issues:
+        issues_to_add = _join_issues(issues)
+        update_subtask_status(subtask_id, issues=issues_to_add)
+
+
+def _scan_unique_failures(subtask_id, results):
+    """
+    Return (unique_failures:list[dict], first_result_skipped:bool).
+    We short-circuit the subtask if the first result matches a global skip.
+    """
+    unique_failures = []
+    first_result = True
+    first_result_skipped = False
+
+    for r in results:
+        error = (r.get("errors") or "")
+
+        # First result can short-circuit the subtask
+        if first_result and should_skip_result(error):
+            update_subtask_status(subtask_id)
+            first_result_skipped = True
+            first_result = False
+            continue
+
+        first_result = False
+
+        # Already handled or globally skippable
+        if r.get("issues") or should_skip_result(error):
+            continue
+
+        # Consider as unique failure (unhandled)
+        unique_failures.append({
+            "error": error,
+            "subtask_id": subtask_id,
+            "case_id": r["r_caseToCaseResult_c_caseId"],
+            "component_id": r.get("r_componentToCaseResult_c_componentId"),
+            "result_id": r["id"]
+        })
+
+    return unique_failures, first_result_skipped
+
+
+def _group_failures_by_error(unique_failures):
+    """
+    Group failures by normalized error so each group can map to its own Jira issue(s).
+    """
+    groups = defaultdict(list)
+    for f in unique_failures:
+        key = normalize_error(f["error"])
+        groups[key].append(f)
+    return groups
+
+
+def _resolve_unique_failures(*, jira_connection, epic, latest_build_id, task_id, subtask_id, unique_failures):
+    """
+    Try to reuse similar open Jira issues; otherwise create an investigation.
+    Returns (batch_updates, issues_str|None, resolved_bool).
+    """
+    if not unique_failures:
+        return [], None, True
+
+    # Reuse existing open issue(s) if the error is similar (lookup by the first item in this group)
+    probe = unique_failures[0]
+    has_similar_issue, blocked_dict = find_similar_open_issues(
+        jira_connection,
+        probe["case_id"],
+        probe["error"],
+    )
+
+    if has_similar_issue and blocked_dict:
+        issue_keys_str = blocked_dict["issues"]
+        updates = [_blocked_update(f["result_id"], blocked_dict["dueStatus"], issue_keys_str) for f in unique_failures]
+        return updates, issue_keys_str, True
+
+    # Otherwise, create a brand-new investigation task for this group
+    print(f"No similar issue found → create new investigation task for subtask {subtask_id}")
+    issue = create_investigation_task_for_subtask(
+        subtask_unique_failures=unique_failures,
+        subtask_id=subtask_id,
+        latest_build_id=latest_build_id,
+        jira_connection=jira_connection,
+        epic=epic,
+        task_id=task_id,
+        case_history_cache={},
+    )
+
+    if not issue:
+        return [], None, False
+
+    issue_key = issue.key
+    updates = [_blocked_update(f["result_id"], {"key": "BLOCKED", "name": "Blocked"}, issue_key) for f in unique_failures]
+    return updates, issue_key, True
+
+
+def _blocked_update(result_id, due_status_dict, issues_str):
+    return {"id": result_id, "dueStatus": due_status_dict, "issues": issues_str}
+
+
+def _join_issues(issues_iterable):
+    """
+    Normalize a collection (or None) of issue strings into a single CSV or None.
+    Each element may itself be a CSV; we split/trim/unique before joining.
+    """
+    if not issues_iterable:
+        return None
+    parts = set()
+    for chunk in issues_iterable:
+        if not chunk:
+            continue
+        for key in str(chunk).split(","):
+            key = key.strip()
+            if key:
+                parts.add(key)
+    if not parts:
+        return None
+    return ", ".join(sorted(parts))
+
+
+def _collect_issue_keys_from_subtasks(subtasks):
+    seen_issue_keys = set()
+    for s in subtasks:
+        issues_str = s.get("issues", "")
+        if not issues_str:
+            continue
+        for k in issues_str.split(","):
+            k = k.strip()
+            if k:
+                seen_issue_keys.add(k)
+    return seen_issue_keys
+
+def _collect_result_issue_keys(results):
+    """
+    From subtask results, collect any issue keys present in the `issues` field.
+    Handles entries that may already be analyzed.
+    """
+    keys = set()
+    for r in results:
+        issues = r.get("issues")
+        if not issues:
+            continue
+        for k in str(issues).split(","):
+            k = k.strip()
+            if k:
+                keys.add(k)
+    return keys
+
+def _close_stale_routine_tasks(jira_connection, latest_build_id, seen_issue_keys):
+    """
+    Close open 'hl_routine_tasks' that did not appear in this run (not reproducible).
+    """
+    jql = "labels in ('hl_routine_tasks') AND labels not in ('test_fix') AND status = Open"
+    open_jira_issues = get_all_issues(jira_connection, jql, fields=["key"])
+    open_keys = {issue.key for issue in open_jira_issues}
+    to_close = open_keys - seen_issue_keys
+    if to_close:
+        build_hash = get_current_build_hash(latest_build_id)
+        print(f"ℹ Found {len(to_close)} issues to close as they are not reproducible in this run.")
+        for issue_key in to_close:
+            close_issue(jira_connection, issue_key, build_hash)
+
+# ---------------------------------------------------------------------------
+# KPI helper
+# ---------------------------------------------------------------------------
+
+def report_aft_ratio_for_latest(builds):
+    """
+    Compute and print AFT ratio KPI for latest DONE build vs beginning of quarter.
+    (Same behavior as your previous get_automated_functional_tests_ratio flow, centralized here.)
+    """
+    latest_build = get_latest_done_build(builds)
+    if not latest_build:
+        return
+
+    # Beginning-of-quarter build discovery
+    quarter_start_date, _, _ = get_current_quarter_info()
+    quarter_start = datetime.combine(quarter_start_date, time.min)
+
+    best_build = None
+    best_delta = None
+    for b in builds:
+        due_str = b.get("dueDate")
+        if not due_str:
+            continue
+        dt = parse_execution_date(due_str)
+        if not dt or dt < quarter_start:
+            continue
+        delta = dt - quarter_start
+        if best_delta is None or delta < best_delta:
+            best_delta = delta
+            best_build = b
+
+    if not best_build:
+        print("✘ Could not find a build from the beginning of the quarter to calculate test ratio.")
+        return
+
+    latest_build_id = latest_build["id"]
+    aft_case_type_id = get_case_type_id_by_name("Automated Functional Test")
+    if not aft_case_type_id:
+        print("✘ Could not find case type ID for 'Automated Functional Test'.")
+        return
+
+    print("⏳ Calculating automated functional test counts...")
+    start_of_quarter_count = get_case_count_by_type_in_build(best_build["id"], aft_case_type_id)
+    current_count = get_case_count_by_type_in_build(latest_build_id, aft_case_type_id)
+    print("✔ Counts calculated.")
+
+    report_poshi_tests_decrease(start_of_quarter_count, current_count)
+
+# ---------------------------------------------------------------------------
+# Existing domain logic (kept)
+# ---------------------------------------------------------------------------
 
 def handle_flaky_result(latest_build_id, jira_connection, result, case_id, result_error, epic):
     similar_open_issues = find_similar_open_issues(jira_connection, case_id, result_error, return_list=True)
@@ -43,6 +452,7 @@ def handle_flaky_result(latest_build_id, jira_connection, result, case_id, resul
         "dueStatus": {"key": "TESTFIX", "name": "Test Fix"},
         "issues": issue.key
     }, issue
+
 
 def process_summary_result(
         summary_result,
@@ -92,6 +502,7 @@ def process_summary_result(
     add_to_unique_tasks(unique_tasks, subtask_id, case_id, result_error)
     case_ids.add(case_id)
     return False, summary_result, True
+
 
 def sort_cases_by_duration(subtask_case_pairs, case_duration_lookup):
     def safe_duration(c_id):
@@ -169,6 +580,7 @@ def build_rca_block(batch_name, test_selector, github_compare):
         f"PORTAL_UPSTREAM_BRANCH_NAME: master"
     )
 
+
 def build_rca_html_block(batch_name, test_selector, github_compare):
     return (
             "<p>Parameters to run "
@@ -182,9 +594,10 @@ def build_rca_html_block(batch_name, test_selector, github_compare):
                                                                                                                                                                                                                        "<b>PORTAL_UPSTREAM_BRANCH_NAME</b>: master</pre>"
     )
 
+
 def get_build_from_beginning_of_current_quarter(builds):
-    quarter_start_date, _, _ = get_current_quarter_info()  # unpack only the first value (date)
-    quarter_start = datetime.combine(quarter_start_date, time.min)  # convert to datetime at 00:00:00
+    quarter_start_date, _, _ = get_current_quarter_info()
+    quarter_start = datetime.combine(quarter_start_date, time.min)
 
     best_build = None
     best_delta = None
@@ -206,14 +619,6 @@ def get_build_from_beginning_of_current_quarter(builds):
     return best_build["id"] if best_build else None
 
 
-def get_latest_done_build(builds):
-    latest_build = builds[0]
-    if latest_build.get("importStatus", {}).get("key") != "DONE":
-        print(f"✘ Latest build '{latest_build.get('name')}' is not DONE.")
-        return None
-    return latest_build
-
-
 def find_or_create_task(build, jira_connection, latest_build_id):
     build_to_tasks = get_build_tasks(build["id"])
 
@@ -231,7 +636,7 @@ def find_or_create_task(build, jira_connection, latest_build_id):
         print(f"[USE] Using existing task {task['id']} with status {due_status_key}.")
         task_id = task["id"]
         subtasks = get_task_subtasks(task_id)
-        if check_and_complete_task_if_all_subtasks_done(task_id,subtasks,jira_connection, latest_build_id):
+        if check_and_complete_task_if_all_subtasks_done(task_id, subtasks, jira_connection, latest_build_id):
             return None
         return task_id
     return None
@@ -245,9 +650,11 @@ def get_latest_build_with_completed_task(builds):
                 return build
     return None
 
+
 def is_handled(result):
     err = (result.get("errors") or "")
     return bool(result.get("issues")) or should_skip_result(err)
+
 
 def should_skip_result(error):
     skip_error_keywords = [
@@ -259,10 +666,10 @@ def should_skip_result(error):
         "TEST_SETUP_ERROR",
         "Unable to run test on CI"
     ]
-    return any(keyword in error for keyword in skip_error_keywords)
+    return any(keyword in (error or "") for keyword in skip_error_keywords)
 
 
-def build_flaky_result_metadata(latest_build_id,result, case_id, result_error):
+def build_flaky_result_metadata(latest_build_id, result, case_id, result_error):
     case_info = get_case_info(case_id)
     return {
         "link": f"https://testray.liferay.com/web/testray#/project/35392/routines/{HEADLESS_ROUTINE_ID}/build/{latest_build_id}/case-result/{result['id']}",
@@ -270,6 +677,7 @@ def build_flaky_result_metadata(latest_build_id,result, case_id, result_error):
         "error": result_error,
         "component": get_component_name(case_info.get("r_componentToCases_c_componentId")) or "Unknown"
     }
+
 
 def create_testfix_task_for_subtask(
         case_id,
@@ -284,7 +692,6 @@ def create_testfix_task_for_subtask(
     no similar open issues exist. It includes context about the failing case,
     component, and error for quicker triage.
     """
-
     case_info = get_case_info(case_id)
     component_name = get_component_name(case_info.get("r_componentToCases_c_componentId")) or "Unknown"
 
@@ -320,24 +727,16 @@ def create_testfix_task_for_subtask(
     )
 
     print(f"✔ Created Test Fix task for case {case_id}: {issue.key}")
-
     return issue
+
 
 def find_similar_open_issues(jira_connection, case_id, result_error, *, return_list=False):
     """
     Look for similar errors in history that have open Jira issues.
 
-    Args:
-        jira_connection: Authenticated Jira connection
-        case_id: Identifier to retrieve test history
-        result_error: The current error message
-        return_list: If True, return list of issue keys; if False, return BLOCKED dict
-
     Returns:
-        If return_list=True:
-            List of matching open issue keys (or empty list if none)
-        Else:
-            Tuple[bool, dict or None] - like the original 'for_unique' function
+        If return_list=True: List[str]
+        Else: Tuple[bool, dict or None]
     """
     seen_issues = set()
     similar_open_issues = []
@@ -383,7 +782,7 @@ def find_similar_open_issues(jira_connection, case_id, result_error, *, return_l
     return similar_open_issues if return_list else (False, None)
 
 
-def handle_module_integration_flaky(latest_build_id,result, case_id, result_error, similar_open_issues):
+def handle_module_integration_flaky(latest_build_id, result, case_id, result_error, similar_open_issues):
     print(f"📌 Case ID {case_id} is a Modules Integration Test. Evaluate manually if it is flaky.")
     error_link = get_error_messages_link(result)
     if error_link:
@@ -391,7 +790,8 @@ def handle_module_integration_flaky(latest_build_id,result, case_id, result_erro
     if similar_open_issues:
         print(f"🛠 Similar open LPD issues found: {', '.join(similar_open_issues)}")
 
-    return False, None, build_flaky_result_metadata(latest_build_id,result, case_id, result_error)
+    return False, None, build_flaky_result_metadata(latest_build_id, result, case_id, result_error)
+
 
 def add_to_unique_tasks(unique_tasks, subtask_id, case_id, error):
     unique_tasks.append({
@@ -462,34 +862,17 @@ def report_poshi_tests_decrease(start_of_quarter_count, current_count):
     decrease_percent = (items_less / start_of_quarter_count) * 100
 
     if decrease_percent < 10.0:
-        print(f"The total number of POSHI tests has gone down by {decrease_percent:.2f}% "
-              f"compared to what it was at the beginning of the quarter. "
-              f"We're targeting a 10% decrease, so there's still work to do.")
+        print(
+            f"The total number of POSHI tests has gone down by {decrease_percent:.2f}% "
+            f"compared to what it was at the beginning of the quarter. "
+            f"We're targeting a 10% decrease, so there's still work to do."
+        )
     else:
-        print(f"The total number of POSHI tests has gone down by {decrease_percent:.2f}% "
-              f"compared to what it was at the beginning of the quarter. "
-              f"KPI of 10% accomplished, but keep pushing!")
-
-
-def count_automated_functional_cases(all_cases_info):
-    automated_count = 0
-    case_type_cache = {}
-
-    for item in all_cases_info:
-        case = item.get("r_caseToCaseResult_c_case")
-        if not case:
-            continue
-        case_type_id = case.get("r_caseTypeToCases_c_caseTypeId")
-        if not case_type_id:
-            continue
-
-        if case_type_id not in case_type_cache:
-            case_type_cache[case_type_id] = get_case_type_name(case_type_id)
-
-        if case_type_cache[case_type_id] == "Automated Functional Test":
-            automated_count += 1
-
-    return automated_count
+        print(
+            f"The total number of POSHI tests has gone down by {decrease_percent:.2f}% "
+            f"compared to what it was at the beginning of the quarter. "
+            f"KPI of 10% accomplished, but keep pushing!"
+        )
 
 
 def is_automated_functional_test(c_id):
@@ -536,6 +919,7 @@ def check_and_complete_task_if_all_subtasks_done(task_id, subtasks, jira_connect
         print(f"ℹ Not all subtasks are complete for task {task_id}, task remains in progress")
         return False  # Task still open
 
+
 def are_errors_similar(current_norm, history_norm, threshold=0.8):
     """
     Compare two error messages semantically using sentence embeddings.
@@ -543,21 +927,8 @@ def are_errors_similar(current_norm, history_norm, threshold=0.8):
     emb_a = model.encode(current_norm, convert_to_tensor=True)
     emb_b = model.encode(history_norm, convert_to_tensor=True)
     similarity = util.pytorch_cos_sim(emb_a, emb_b).item()
-
     return similarity >= threshold
 
-#def are_errors_similar(current, history, threshold=0.6):
-#    current_norm = normalize_error(current)
-#    history_norm = normalize_error(history)
-#
-#    similarity = jellyfish.jaro_winkler_similarity(current_norm, history_norm)
-#
-#    if "testGetObjectEntryWithKeywords" in current:
-#        print("Current norm:", current_norm)
-#        print("History norm:", history_norm)
-#        print("Similarity between them:", str(similarity))
-#
-#    return similarity >= threshold
 
 def group_errors_by_type(unique_tasks):
     error_to_cases = defaultdict(list)
@@ -701,6 +1072,7 @@ def get_task_routine_id(task_id):
     build_info = get_build_info(build_id)
     return build_info["r_routineToBuilds_c_routineId"]
 
+
 def create_investigation_task_for_subtask(
         subtask_unique_failures,
         subtask_id,
@@ -712,12 +1084,9 @@ def create_investigation_task_for_subtask(
 ):
     """
     Creates an investigation task in Jira for a subtask with unique failures.
-    Groups failures by error (like in generate_combined_html_report),
-    outputs a Jira-friendly description with a table of test names, components, duration,
-    and RCA details (once, from first test).
-    Updates Testray results with BLOCKED status and Jira issue key.
+    Groups failures by error, outputs a Jira-friendly description with a table of
+    test names, components, duration, and RCA details (once).
     """
-
     # Group by error
     error_to_cases = group_errors_by_type(subtask_unique_failures)
     case_duration_lookup = build_case_duration_lookup(subtask_unique_failures, latest_build_id)
@@ -730,15 +1099,14 @@ def create_investigation_task_for_subtask(
 
     first_error = None
     rca_included = False
-
     component_name = None
 
     for error, subtask_case_pairs in error_to_cases.items():
         if not first_error:
-            first_error = error[:80]  # for Jira summary
+            first_error = error[:80]  # Jira summary
 
-        description_lines.append("h3. Error")  # heading
-        description_lines.append(f"{{code}}{error}{{code}}")  # code block for error
+        description_lines.append("h3. Error")
+        description_lines.append(f"{{code}}{error}{{code}}")
 
         sorted_cases = sort_cases_by_duration(subtask_case_pairs, case_duration_lookup)
         printed_rows, rca_info, batch_name, test_selector, github_compare, component_name = build_case_rows(
@@ -746,14 +1114,11 @@ def create_investigation_task_for_subtask(
         )
 
         description_lines.append("")
-        description_lines.append("|| Test Name || Component || Duration ||")  # table header
+        description_lines.append("|| Test Name || Component || Duration ||")
         for row in printed_rows:
             name, duration, component = row
-            description_lines.append(f"| {name} | {component} | {duration} |")  # table rows
+            description_lines.append(f"| {name} | {component} | {duration} |")
 
-        # Blank line
-        description_lines.append("")
-        # Include RCA info once, from the first test of the first error
         if not rca_included and batch_name and test_selector and github_compare:
             description_lines.append("")
             description_lines.append("h3. RCA Details")
@@ -767,7 +1132,7 @@ def create_investigation_task_for_subtask(
     description = "\n".join(description_lines)
     jira_components = [
         ComponentMapping.TestrayToJira.get(c, c)  # fallback to original if not mapped
-        for c in component_name.split(",")
+        for c in (component_name or "Unknown").split(",")
     ]
 
     # Create Jira issue
@@ -781,5 +1146,4 @@ def create_investigation_task_for_subtask(
     )
 
     print(f"✔ Created investigation task for subtask {subtask_id}: {issue.key}")
-
     return issue

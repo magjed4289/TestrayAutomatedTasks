@@ -179,23 +179,6 @@ def fetch_case_results(case_id, routine_id, status=None, page_size=500):
 
     return all_items
 
-def get_all_cases_info_from_build(build_id):
-    """Fetch all case results for a given build (paginated)."""
-    page = 1
-    all_cases_info = []
-
-    while True:
-        url = f"{BASE_URL}/builds/{build_id}/buildToCaseResult?fields=r_caseToCaseResult_c_case&nestedFields=r_caseToCaseResult_c_case&pageSize=500&page={page}"
-        data = get_json(url)
-        items = data.get("items", [])
-        all_cases_info.extend(items)
-
-        if len(items) < 500:
-            break
-        page += 1
-
-    return all_cases_info
-
 def get_all_builds(routine_id=HEADLESS_ROUTINE_ID):
     """
     Fetch all builds for a given routine, handling pagination.
@@ -257,6 +240,40 @@ def get_case_result(case_result_id):
     url = f"{BASE_URL}/caseresults/{case_result_id}"
     return get_json(url)
 
+def get_case_count_by_type_in_build(build_id, case_type_id):
+    """Get the count of unique cases of a specific type that have results in a given build."""
+    if not case_type_id:
+        return 0
+
+    all_items = []
+    page = 1
+    page_size = 500
+
+    while True:
+        url = (f"{BASE_URL}/builds/{build_id}/buildToCaseResult"
+               f"?filter=r_caseToCaseResult_c_case/r_caseTypeToCases_c_caseTypeId eq {case_type_id}"
+               f"&fields=r_caseToCaseResult_c_caseId"
+               f"&pageSize={page_size}&page={page}")
+        data = get_json(url)
+        items = data.get("items", [])
+        all_items.extend(items)
+
+        if len(items) < page_size:
+            break
+        page += 1
+
+    unique_case_ids = {item['r_caseToCaseResult_c_caseId'] for item in all_items if 'r_caseToCaseResult_c_caseId' in item}
+    return len(unique_case_ids)
+
+@lru_cache(maxsize=None)
+def get_case_type_id_by_name(case_type_name):
+    """Get the ID of a case type by its name."""
+    url = f"{BASE_URL}/casetypes?filter=name eq '{case_type_name}'&fields=id"
+    result = get_json(url)
+    items = result.get("items", [])
+    if items:
+        return items[0].get("id")
+    return None
 
 @lru_cache(maxsize=None)
 def get_case_type_name(case_type_id):

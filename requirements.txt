@@ -1,8 +1,6 @@
 certifi==2025.8.3
-cffi~=1.17.1
 chardet~=5.2.0
 charset-normalizer==3.4.3
-click~=8.2.1
 defusedxml==0.7.1
 distro~=1.9.0
 idna==3.10

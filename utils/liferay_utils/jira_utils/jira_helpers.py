@@ -68,24 +68,83 @@ def _parse_permission(permissions):
         parsed_permission.append(current_permission)
     return parsed_permission
 
-def close_issue(jira_local, issue, build_hash):
+def close_issue(jira_local, issue_key, build_hash):
     """
-    Closes a Jira issue with a 'Discarded' resolution and adds a comment.
+    Workflow to close an issue properly:
+    1. Move parent to 'Selected for Development'.
+    2. Close all sub-tasks (created automatically once parent is in SFD).
+    3. Close parent with 'Discarded' resolution.
     """
     try:
-        # Find the 'Closed' transition ID, as the API requires the ID, not the name.
-        transitions = jira_local.transitions(issue)
+        parent_issue = jira_local.issue(issue_key)
+
+        # --- Step 1: Parent → 'Selected for Development'
+        transitions = jira_local.transitions(issue_key)
+        selected_dev_transition = next(
+            (t for t in transitions if t['name'] == Transition.Selected_for_development), None
+        )
+        if selected_dev_transition:
+            jira_local.transition_issue(issue_key, transition=selected_dev_transition['id'])
+            print(f"✔ {issue_key} → 'Selected for Development'")
+        else:
+            print(f"✘ Could not find 'Selected for Development' transition for {issue_key}")
+            return
+
+        # --- Step 2: Close all sub-tasks (after automation creates them)
+        parent_issue = jira_local.issue(issue_key)  # refresh to load subtasks
+        subtasks = getattr(parent_issue.fields, "subtasks", [])
+        for subtask in subtasks:
+            subtask_key = subtask.key
+            print(f"→ Closing child {subtask_key}")
+            _transition_to_closed(jira_local, subtask_key, build_hash)
+
+        # --- Step 3: Parent → 'Closed' with resolution 'Discarded'
+        transitions = jira_local.transitions(issue_key)
+        close_transition = next(
+            (t for t in transitions if t['name'] == Transition.Closed), None
+        )
+        if close_transition:
+            jira_local.transition_issue(
+                issue_key,
+                transition=close_transition['id'],
+                resolution={'name': 'Discarded'}
+            )
+            jira_local.add_comment(
+                issue_key,
+                f"Closing. Not reproducible in current SHA {build_hash}"
+            )
+            print(f"✔ {issue_key} → 'Closed' with 'Discarded'")
+        else:
+            print(f"✘ Could not find 'Closed' transition for {issue_key}")
+
+    except Exception as e:
+        print(f"✘ Failed to process issue {issue_key}: {e}")
+
+
+def _transition_to_closed(jira_local, issue_key, build_hash):
+    """
+    Closes a single sub-task (directly to 'Closed' with 'Discarded').
+    """
+    try:
+        transitions = jira_local.transitions(issue_key)
         close_transition = next((t for t in transitions if t['name'] == Transition.Closed), None)
 
         if close_transition:
-            jira_local.transition_issue(issue, transition=close_transition['id'], resolution={'name': 'Discarded'})
-            comment = f"Closing. Not reproducible in current SHA {build_hash}"
-            jira_local.add_comment(issue, comment)
-            print(f"✔ Closed issue {issue} as it was not reproducible in SHA {build_hash}.")
+            jira_local.transition_issue(
+                issue_key,
+                transition=close_transition['id'],
+                resolution={'name': 'Discarded'}
+            )
+            jira_local.add_comment(
+                issue_key,
+                f"Closing sub-task. Not reproducible in current SHA {build_hash}"
+            )
+            print(f"✔ {issue_key} → 'Closed' with 'Discarded'")
         else:
-            print(f"✘ Could not find 'Closed' transition for issue {issue}.")
+            print(f"✘ Could not find 'Closed' transition for sub-task {issue_key}")
+
     except Exception as e:
-        print(f"✘ Failed to close issue {issue}: {e}")
+        print(f"✘ Failed to close sub-task {issue_key}: {e}")
 
 def close_functional_automation_subtask(jira_local, story, poshi_task=''):
     for subtask in story.get_field('subtasks'):

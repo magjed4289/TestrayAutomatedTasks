@@ -305,7 +305,7 @@ def get_routine_to_builds():
 
 def get_subtask_case_results(subtask_id):
     """Get case results under a subtask."""
-    url = f"{BASE_URL}/subtasks/{subtask_id}/subtaskToCaseResults?fields=id,executionDate,errors,issues,r_caseToCaseResult_c_caseId,r_componentToCaseResult_c_componentId"
+    url = f"{BASE_URL}/subtasks/{subtask_id}/subtaskToCaseResults?fields=id,executionDate,errors,issues,r_caseToCaseResult_c_caseId,r_componentToCaseResult_c_componentId&pageSize=-1"
     return get_json(url).get("items", [])
 
 

@@ -519,8 +519,6 @@ def build_case_rows(sorted_cases, case_duration_lookup, build_id, history_cache)
     rca_selector = None
     rca_compare = None
 
-    failing_hash = get_current_build_hash(build_id)
-
     component_name = "Unknown"
 
     for _, case_id, component_id in sorted_cases:
@@ -532,7 +530,10 @@ def build_case_rows(sorted_cases, case_duration_lookup, build_id, history_cache)
             component_name = get_component_name(component_id) if component_id else "Unknown"
             raw_duration = case_duration_lookup.get(int(case_id))
             duration = raw_duration if isinstance(raw_duration, (int, float)) else None
+
             passing_hash = get_last_passing_git_hash(case_id, build_id, history_cache)
+            failing_hash = get_first_failing_git_hash(case_id, build_id, history_cache)
+
             github_compare = (
                 f"https://github.com/liferay/liferay-portal/compare/{passing_hash}...{failing_hash}"
                 if passing_hash and failing_hash else "###"
@@ -557,6 +558,53 @@ def build_case_rows(sorted_cases, case_duration_lookup, build_id, history_cache)
 
     return printed_rows, rca_info, rca_batch, rca_selector, rca_compare, component_name
 
+def get_last_passing_git_hash(case_id, build_id, history_cache):
+    entire_history = history_cache.get(case_id)
+    if entire_history is None:
+        entire_history = get_case_result_history_for_routine(case_id)
+        history_cache[case_id] = entire_history
+
+    result_history_for_build = filter_case_result_history_by_build(entire_history, build_id)
+    if not result_history_for_build:
+        return None
+
+    failing_hash_execution_date = result_history_for_build[0].get('executionDate')
+    item = get_last_passing_result(entire_history, failing_hash_execution_date)
+    last_passing_hash = item.get('gitHash') if item else None
+    return last_passing_hash
+
+
+def get_first_failing_git_hash(case_id, build_id, history_cache):
+    """
+    Find the first failing git hash after the last passing run for this case.
+    """
+    entire_history = history_cache.get(case_id)
+    if entire_history is None:
+        entire_history = get_case_result_history_for_routine(case_id)
+        history_cache[case_id] = entire_history
+
+    if not entire_history:
+        return None
+
+    result_history_for_build = filter_case_result_history_by_build(entire_history, build_id)
+    if not result_history_for_build:
+        return None
+
+    failing_execution_date = result_history_for_build[0].get("executionDate")
+
+    last_passing = get_last_passing_result(entire_history, failing_execution_date)
+    if not last_passing:
+        return result_history_for_build[0].get("gitHash")
+
+    last_pass_date = parse_execution_date(last_passing["executionDate"])
+    for item in reversed(entire_history):
+        exec_date = parse_execution_date(item.get("executionDate"))
+        if not exec_date:
+            continue
+        if exec_date > last_pass_date and item.get("status") in STATUS_FAILED_BLOCKED_TESTFIX:
+            return item.get("gitHash")
+
+    return None
 
 def get_batch_info(case_name, case_type_name):
     if case_type_name == "Playwright Test":
@@ -1043,23 +1091,6 @@ def filter_case_result_history_by_build(history, build_id):
         item for item in history
         if item.get("testrayBuildId") == build_id
     ]
-
-
-def get_last_passing_git_hash(case_id, build_id, history_cache):
-    entire_history = history_cache.get(case_id)
-    if entire_history is None:
-        entire_history = get_case_result_history_for_routine(case_id)
-        history_cache[case_id] = entire_history
-
-    result_history_for_build = filter_case_result_history_by_build(entire_history, build_id)
-    if not result_history_for_build:
-        return None
-
-    failing_hash_execution_date = result_history_for_build[0].get('executionDate')
-    item = get_last_passing_result(entire_history, failing_hash_execution_date)
-    last_passing_hash = item.get('gitHash') if item else None
-    return last_passing_hash
-
 
 def get_current_build_hash(build_id):
     build = get_build_info(build_id)

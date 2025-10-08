@@ -705,6 +705,9 @@ def is_handled(result):
 
 
 def should_skip_result(error):
+    if "AssertionError" in error:
+        return False
+
     skip_error_keywords = [
         "Failed prior to running test",
         "PortalLogAssertorTest#testScanXMLLog",

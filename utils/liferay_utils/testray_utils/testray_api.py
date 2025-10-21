@@ -179,6 +179,11 @@ def fetch_case_results(case_id, routine_id, status=None, page_size=500):
 
     return all_items
 
+def get_all_cases_info_from_build(build_id):
+    """Recreate old API behavior with nestedFields for case metadata."""
+    url = f"{BASE_URL}/builds/{build_id}/buildToCaseResult?pageSize=-1&nestedFields=r_caseToCaseResult_c_case"
+    return get_json(url).get("items", [])
+
 def get_all_builds(routine_id=HEADLESS_ROUTINE_ID):
     """
     Fetch all builds for a given routine, handling pagination.

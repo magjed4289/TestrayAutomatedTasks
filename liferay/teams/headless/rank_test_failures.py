@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import sys
 import os
-from datetime import date
+from typing import Any, Dict, Set
 
 # Ensure repo root is on path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
@@ -24,7 +24,7 @@ BAD_STATUSES = {"FAILED", "BLOCKED", "TESTFIX"}
 RUN_STATUSES = BAD_STATUSES | {"PASSED"}  # ignore setup/skipped/etc.
 
 # Months: May–Aug
-INCLUDED_MONTHS = {7, 8}
+INCLUDED_MONTHS = {9,10}
 
 # Skip any CASE whose name contains these substrings
 IGNORE_CASE_SUBSTRINGS = ("PortalLogAssertorTest-modules", "Top Level Build")
@@ -53,19 +53,28 @@ def _in_range(d, start_d, end_d):
     return start_d <= d.date() <= end_d
 
 
-def collect_case_failures_for_year(year=2025):
+
+def collect_case_failures_for_year(year: int = 2025) -> Dict[int, Dict[str, Any]]:
     """
     Count FAILS per test case across Headless builds in selected months of {year}.
     Assume every test runs in each analyzed build, so RUNS = number of builds.
+    Also collect any linked issues for each case across builds.
     """
     print(f"📊 Collecting HEADLESS test case results for {year} (months {sorted(INCLUDED_MONTHS)})...")
 
     builds = get_routine_to_builds()  # already Headless only
-    case_stats = defaultdict(lambda: {"runs": 0, "fails": 0, "name": None, "component_id": None})
+    case_stats: Dict[int, Dict[str, Any]] = defaultdict(lambda: {
+        "runs": 0,
+        "fails": 0,
+        "name": None,
+        "component_id": None,
+        "issues": set(),      # type: Set[str]
+        "issues_str": "",     # flattened string for printing
+    })
 
-    analyzed_builds = []
+    analyzed_builds: list[int] = []
 
-    # --- Pass 1: gather failures, metadata ---
+    # --- Pass 1: gather failures, metadata, and issues ---
     for build in builds:
         due_str = build.get("dueDate")
         if not due_str:
@@ -111,14 +120,27 @@ def collect_case_failures_for_year(year=2025):
                 stats["name"] = case_name
                 stats["component_id"] = meta["component_id"]
 
+            # Track fails
             if status in BAD_STATUSES:
                 stats["fails"] += 1
 
-    # --- Pass 2: fix runs to number of analyzed builds ---
+            # --- Track issues safely ---
+            issues_str = result.get("issues")
+            if issues_str:
+                for issue in issues_str.split(","):
+                    issue = issue.strip()
+                    if issue:
+                        stats["issues"].add(issue)
+
+    # --- Pass 2: normalize runs and flatten issues ---
     total_runs = len(analyzed_builds)
     print(f"📈 Normalizing RUNS to {total_runs} builds for every case")
+
     for stats in case_stats.values():
         stats["runs"] = total_runs
+        if isinstance(stats.get("issues"), set):
+            # Put the stringified version in a separate field
+            stats["issues_str"] = ", ".join(sorted(stats["issues"]))
 
     return case_stats
 
@@ -138,6 +160,7 @@ def rank_worst_cases(case_stats, top_n=50, min_runs=3):
             "runs": runs,
             "fails": fails,
             "fail_ratio": fail_ratio,
+            "issues": stats.get("issues_str", ""),
         })
     ranked.sort(key=lambda x: (-x["fail_ratio"], -x["fails"], -x["runs"]))
     return ranked[:top_n]
@@ -158,16 +181,16 @@ def print_ranking(ranked_cases):
         return component_cache[cid]
 
     print("\n--- Worst Failing Tests Ranking ---\n")
-    header = f"{'Case ID':<10} {'Fails':<6} {'Fail %':<8} {'Component':<40} Name"
+    header = f"{'Case ID':<10} {'Fails':<6} {'Runs':<6} {'Fail %':<8} {'Component':<30} {'Issues':<25} Name"
     print(header)
     print("-" * len(header))
 
     for case in ranked_cases:
         fail_pct = f"{case['fail_ratio']*100:.1f}%"
         component = comp_name(case["component_id"])
-        print(f"{case['case_id']:<10} {case['fails']:<6} {fail_pct:<8} {component:<40} {case['name']}")
+        issues = (case.get("issues") or "")
+        print(f"{fail_pct:<8} {component:<30} {issues}")
 
-        print(f"{case['case_id']:<10} {case['fails']:<6} {case['runs']:<6} {fail_pct:<8} {component:<40} {case['name']}")
 
 
 if __name__ == "__main__":

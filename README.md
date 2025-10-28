@@ -162,18 +162,23 @@ pip install -r requirements.txt
 Run the script from the correct subdirectory:
 
 ```bash
-cd /home/me/Projects/eng/TestrayAutomatedTasks/liferay/teams/headless
+cd /your/path/to/repo/TestrayAutomatedTasks/liferay/teams/headless
 python3 headless_testray.py
 ```
 
 ---
 
-## 🧠 Optional: Add an Alias for Convenience
+## 🧠 Optional: Add an Alias for Convenience and Create a Virtual Environment
 
 To avoid typing the full path every time, you can add an alias in your `.bashrc` or `.zshrc`:
 
 ```bash
-alias rta="cd /home/me/Projects/eng/TestrayAutomatedTasks/liferay/teams/headless && python3 headless_testray.py"
+alias rta='cd /your/path/to/TestrayAutomatedTasks && \
+[ -d ".venv" ] || python3 -m venv .venv && \
+source .venv/bin/activate && \
+pip install -r requirements.txt && \
+cd liferay/teams/headless && \
+python3 headless_testray.py'
 ```
 
 After saving, apply the changes:
